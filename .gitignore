@@ -1,0 +1,20 @@
+/build/
+/.local/
+/vendor/
+*.pcap
+*.pcapng
+*.deb
+.DS_Store
+/target/
+__pycache__/
+*.pyc
+# Planning, research and validation notes stay local.
+/.impeccable/
+/CONTEXT.md
+/DESIGN.md
+/PRODUCT.md
+/docs/adr/
+/docs/*-research.md
+/docs/*validation.md
+/tests/per-app/
+/tests/resources.c

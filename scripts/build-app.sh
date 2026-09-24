@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+platform=${1:-iphoneos}
+# Rootless jailbreaks install under /var/jb; rootful ones (every iOS 14 jailbreak) use /.
+case ${SLIPSTREAM_SCHEME:=rootless} in
+ rootless) SLIPSTREAM_PREFIX=/var/jb ;;
+ rootful) SLIPSTREAM_PREFIX= ;;
+ *) echo 'SLIPSTREAM_SCHEME must be rootless or rootful' >&2; exit 2 ;;
+esac
+export SLIPSTREAM_SCHEME SLIPSTREAM_PREFIX
+export IPHONEOS_DEPLOYMENT_TARGET=14.0
+case "$platform" in
+ iphoneos) target=arm64-apple-ios14.0; output=build/install/Slipstream.app ;;
+ iphonesimulator) target=arm64-apple-ios14.0-simulator; output=build/simulator/Slipstream.app ;;
+ *) echo 'usage: build-app.sh [iphoneos|iphonesimulator]' >&2; exit 2 ;;
+esac
+sdk=$(xcrun --sdk "$platform" --show-sdk-path)
+mkdir -p "$output"
+xcrun --sdk "$platform" clang -target "$target" -isysroot "$sdk" -Os -Wall -Wextra -Werror -DSLIPSTREAM_PREFIX=\"$SLIPSTREAM_PREFIX\" -c app/Bridge.c -o "build/Bridge-$platform.o"
+xcrun --sdk "$platform" swiftc -target "$target" -sdk "$sdk" -swift-version 5 -O -parse-as-library \
+ -import-objc-header app/Bridge.h app/Slipstream.swift "build/Bridge-$platform.o" \
+ -Xlinker -rpath -Xlinker @executable_path/Frameworks -framework SwiftUI -framework UIKit -o "$output/Slipstream"
+version=${SLIPSTREAM_VERSION:-$(cat VERSION)}
+printf '%s' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo 'Use a version such as 0.3.0' >&2; exit 1; }
+cp app/Info.plist "$output/Info.plist"
+for key in CFBundleShortVersionString CFBundleVersion; do plutil -replace "$key" -string "$version" "$output/Info.plist"; done
+cp app/Assets/*.png "$output/"
+if [ "$platform" = iphoneos ]; then
+ xcrun --sdk iphoneos clang -target "$target" -isysroot "$sdk" -Os -Wall -Wextra -Werror -DSLIPSTREAM_PREFIX=\"$SLIPSTREAM_PREFIX\" -x objective-c -fobjc-arc -fblocks app/Helper.c app/ProviderMessage.m -framework Foundation -framework NetworkExtension -o "$output/slipstream-helper"
+ extension="$output/PlugIns/AppProxyProvider.appex"
+ rm -rf "$output/PlugIns/PacketProvider.appex"
+ mkdir -p "$extension"
+ cp provider/Info.plist "$extension/Info.plist"
+ for key in CFBundleShortVersionString CFBundleVersion; do plutil -replace "$key" -string "$version" "$extension/Info.plist"; done
+ # The Rust library shares the proxy engine and its regression tests with the CLI.
+ cargo build --locked --release --target aarch64-apple-ios --lib
+ xcrun --sdk iphoneos clang -target "$target" -isysroot "$sdk" -Os -Wall -Wextra -Werror -fobjc-arc -fblocks \
+  -fapplication-extension -Wl,-e,_NSExtensionMain provider/AppProxyProvider.m target/aarch64-apple-ios/release/libslipstream.a \
+  -framework Foundation -framework Network -framework NetworkExtension -framework SystemConfiguration -framework Security -framework CoreFoundation -liconv -lresolv \
+  -o "$extension/AppProxyProvider"
+ ldid -Ilocal.slipstream.app.proxy -Sprovider/entitlements.plist "$extension/AppProxyProvider"
+ # iOS 14 lacks the Swift concurrency runtime. Newer systems load theirs from /usr/lib/swift first.
+ mkdir -p "$output/Frameworks"
+ cp "$(dirname "$(xcrun --find swiftc)")/../lib/swift-5.5/iphoneos/libswift_Concurrency.dylib" "$output/Frameworks/"
+ ldid -S "$output/Frameworks/libswift_Concurrency.dylib"
+ ldid -Ilocal.slipstream.app -Sapp/entitlements.plist "$output/Slipstream"
+ ldid -Ilocal.slipstream.app -Spackaging/cli-entitlements.plist "$output/slipstream-helper"
+else
+ codesign --force --sign - "$output"
+fi
+printf 'Built %s\n' "$output"

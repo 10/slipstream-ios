@@ -1,0 +1,109 @@
+name: Release Slipstream
+run-name: Release Slipstream ${{ inputs.version }}
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version (MAJOR.MINOR.PATCH, for example 0.7.1)'
+        required: true
+        type: string
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: slipstream-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLIPSTREAM_VERSION: ${{ inputs.version }}
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate release
+        env:
+          BRANCH: ${{ github.ref }}
+        run: |
+          test "$BRANCH" = refs/heads/main
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          sys.path.insert(0, 'scripts')
+          from release import version
+          value = version(os.environ['SLIPSTREAM_VERSION'])
+          releases = json.loads(subprocess.check_output(['gh','release','list','--limit','100','--json','tagName,isDraft,isPrerelease']))
+          latest = [r['tagName'].removeprefix('v') for r in releases if not r['isDraft'] and not r['isPrerelease']]
+          if latest and tuple(map(int,value.split('.'))) <= max(tuple(map(int,version(v).split('.'))) for v in latest):
+              raise SystemExit('Choose a version newer than every published release.')
+          PY
+      - name: Install build tools
+        run: |
+          brew install ldid dpkg gnupg
+          rustup toolchain install 1.96.1 --profile minimal --target aarch64-apple-ios
+          rustup override set 1.96.1
+      - name: Build and verify
+        run: |
+          ./scripts/build.sh
+          cargo test --locked --lib
+          cargo test --locked -p tun2proxy --lib basic_auth_header_value
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          sh -n scripts/install.sh scripts/slipstreamctl packaging/maintainer.sh
+          python3 scripts/release.py package "$SLIPSTREAM_VERSION"
+          SLIPSTREAM_SCHEME=rootful ./scripts/build.sh
+          python3 scripts/release.py package "$SLIPSTREAM_VERSION"
+          for deb in build/io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb; do python3 tests/check_package.py "$deb"; done
+      - name: Sign repository
+        env:
+          GNUPGHOME: ${{ runner.temp }}/slipstream-gnupg
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          REPO_URL: https://10.github.io/slipstream-ios/
+        run: |
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
+          key=$(gpg --show-keys --with-colons packaging/repository-key.gpg | awk -F: '$1=="fpr" {print $10; exit}')
+          gpg --batch --list-secret-keys "$key"
+          # Earlier published versions stay installable, so a cached Sileo index never points at a missing file.
+          mkdir -p build/published
+          gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft | not) | .tagName' |
+            while read -r tag; do gh release download "$tag" --pattern '*.deb' --dir build/published; done
+          shopt -s nullglob
+          python3 scripts/release.py repository "$REPO_URL" build/repository build/published/*.deb build/io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb --signing-key "$key"
+          gpg --batch --verify build/repository/Release.gpg build/repository/Release
+          cd build
+          shasum -a 256 io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb > SHA256SUMS
+      - name: Stage GitHub release
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          tag="v$SLIPSTREAM_VERSION"
+          if gh release view "$tag" --json isDraft,targetCommitish > build/existing-release.json 2>/dev/null; then
+            python3 - <<'PY'
+          import json,os
+          release=json.load(open('build/existing-release.json'))
+          if not release['isDraft'] or release['targetCommitish'] != os.environ['COMMIT']:
+              raise SystemExit('Existing release belongs to another commit or is already published.')
+          PY
+          else
+            gh release create "$tag" --draft --target "$COMMIT" --title "Slipstream $SLIPSTREAM_VERSION" --generate-notes
+          fi
+          gh release upload "$tag" build/io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb build/SHA256SUMS --clobber
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: build/repository
+      - id: deploy
+        uses: actions/deploy-pages@v5
+      - name: Publish GitHub release
+        run: gh release edit "v$SLIPSTREAM_VERSION" --draft=false --latest
+      - name: Remove signing material
+        if: always()
+        env:
+          GNUPGHOME: ${{ runner.temp }}/slipstream-gnupg
+        run: |
+          gpgconf --kill gpg-agent || true
+          rm -rf "$GNUPGHOME"
