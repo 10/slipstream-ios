@@ -15,6 +15,8 @@
 
 ---
 
+https://github.com/user-attachments/assets/fe4b98c0-dd05-452f-87f3-2f2fb45c1ead
+
 <p align="center">
   <img src="docs/images/proxies.png" width="250" alt="Proxy list with protection on and a completed connection check">
   <img src="docs/images/apps.png" width="250" alt="Apps screen with two of three apps selected">
