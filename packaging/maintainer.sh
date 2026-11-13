@@ -6,18 +6,14 @@ export PATH
 base=/var/jb
 ctl=$base/usr/local/bin/slipstreamctl
 case '@SCRIPT@:'"${1:-}" in
- preinst:install|preinst:upgrade)
-  if [ -x "$base/usr/local/bin/slipstream" ] && [ "$("$base/usr/local/bin/slipstream" backend 2>/dev/null || true)" != native ]; then
-   if [ -f "$base/etc/slipstream/enabled" ]; then
-    echo 'Turn protection off in the existing Slipstream version before this one-time native VPN migration, then retry.' >&2
-    exit 1
-   fi
-   # The installed old binary is the authority for its PF, routes, DNS and netagent state.
-   /var/jb/bin/sh "$base/usr/local/bin/slipstreamctl" disable
+ preinst:upgrade)
+  if dpkg --compare-versions "${2:-}" lt 0.7.0; then
+   echo 'Upgrading from Slipstream before 0.7.0 is not supported. Install 0.7.1 first, or remove the old version.' >&2
+   exit 1
   fi
   ;;
  prerm:remove|prerm:deconfigure)
-  # Remove the exact owned native configuration while the helper is still on disk.
+  # Remove the exact owned native configuration while the CLI is still on disk.
   /var/jb/bin/sh "$ctl" disable
   ;;
  postinst:configure|postinst:abort-upgrade|postinst:abort-remove|postinst:abort-deconfigure)
@@ -26,9 +22,8 @@ case '@SCRIPT@:'"${1:-}" in
   chmod 700 "$base/etc/slipstream" "$base/var/run/slipstream"
   chown -R root:wheel "$base/Applications/Slipstream.app"
   chmod 4755 "$base/Applications/Slipstream.app/slipstream-helper"
-  # Retire files from package and earlier manual installations.
-  rm -f "$base/Library/LaunchDaemons/local.slipstream.plist"
-  rm -f "$base/usr/local/bin/slipstream-sockets" "$base/etc/slipstream/direct-domains.json" "$base/etc/slipstream/direct-domains.json.new"
+  # Releases before 0.7.2 copied the selected proxy and its credentials here.
+  rm -f "$base/etc/slipstream/config.json" "$base/etc/slipstream/config.json.new"
   uicache -p "$base/Applications/Slipstream.app"
   if [ -f "$base/etc/slipstream/enabled" ]; then
    /var/jb/bin/sh "$ctl" enable
@@ -38,9 +33,6 @@ case '@SCRIPT@:'"${1:-}" in
   uicache -u "$base/Applications/Slipstream.app" 2>/dev/null || true
   ;;
  postrm:purge)
-  for name in config.json proxies.json direct-domains.json app-routing.json enabled control.lock tunnel.uuid; do
-   rm -f "$base/etc/slipstream/$name" "$base/etc/slipstream/$name.new"
-  done
-  rmdir "$base/etc/slipstream" 2>/dev/null || true
+  rm -rf "$base/etc/slipstream" "$base/var/run/slipstream"
   ;;
 esac

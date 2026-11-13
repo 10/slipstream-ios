@@ -1,4 +1,4 @@
-// MobileWiFi ABI references: see SOURCES.md. Experimental device-test helper.
+// MobileWiFi ABI references: see wifi-cycle.md. Experimental device-test helper.
 #include <CoreFoundation/CoreFoundation.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>

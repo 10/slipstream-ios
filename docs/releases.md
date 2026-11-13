@@ -31,9 +31,10 @@ The package installs the public key for authenticated APT refreshes. Sileo can a
 Package ID: `io.github.10.slipstream`; architecture: `iphoneos-arm64` (rootless) or `iphoneos-arm` (rootful, built with `SLIPSTREAM_SCHEME=rootful`); iOS minimum: 14.0; requires `uikittools` 2.1.2 or newer, because older `uicache` registers the app proxy provider without its entitlements. The app's bundle ID, `local.slipstream.app`, is unchanged from earlier releases.
 
 - A clean installation starts with protection off until a proxy is configured.
-- Saved configuration, proxy selection and lists survive upgrades. Native upgrades keep the VPN configuration and saved enabled preference, and reconnect the updated provider. The one-time upgrade from 0.4.x requires protection to be off.
-- Removal disables the engine and restores networking before files are removed. Saved configuration remains for reinstall; `apt-get purge io.github.10.slipstream` also removes it. Diagnostic captures are not deleted.
-- `slipstreamctl uninstall` delegates to APT when dpkg owns the installation.
+- Saved lists, proxy selection and app settings survive upgrades. Upgrades keep the VPN configuration and saved enabled preference, and reconnect the updated provider. The package refuses to upgrade a release before 0.7.0: remove it first, or install 0.7.1 before the newer version.
+- Removal disables the engine and restores networking before files are removed. Saved settings remain for reinstall; `apt-get purge io.github.10.slipstream` removes them too.
+- To install an earlier release, turn protection off first, then select the proxy again in the app. Releases before 0.7.2 refuse to replace this version while protected.
+- `slipstreamctl uninstall` runs `apt-get remove`.
 
 A locally installed `.deb` is managed by Sileo like any other package. Once the phone has the source, newer versions from the repository replace it as ordinary updates.
 
@@ -48,7 +49,7 @@ python3 tests/check_package.py build/io.github.10.slipstream_0.7.2_iphoneos-arm6
 `release.py package` follows the last build's scheme. To test a signed repository locally, point `GNUPGHOME` at a keyring holding the signing key:
 
 ```sh
-python3 scripts/release.py repository https://10.github.io/slipstream-ios/ /tmp/repo build/io.github.10.slipstream_*.deb --signing-key FINGERPRINT
+python3 scripts/release.py repository /tmp/repo build/io.github.10.slipstream_*.deb --signing-key FINGERPRINT
 ```
 
 Build tools are Xcode, Rust, GitHub CLI, `ldid`, `dpkg`, Python 3, and GnuPG for signing. Packages use xz compression and root:wheel ownership; only the app's fixed-purpose helper is setuid.
@@ -57,4 +58,4 @@ Build tools are Xcode, Rust, GitHub CLI, `ldid`, `dpkg`, Python 3, and GnuPG for
 
 ## Repository setup
 
-GitHub Pages uses **GitHub Actions** as its source, and the `github-pages` environment accepts deployments from `main`. To move the source to a custom domain, configure it in Pages and DNS, update `REPO` in `scripts/release.py` and `REPO_URL` in the workflow, and publish a new release. Existing users then update their Sileo source.
+GitHub Pages uses **GitHub Actions** as its source, and the `github-pages` environment accepts deployments from `main`. To move the source to a custom domain, configure it in Pages and DNS, update `REPO` in `scripts/release.py` and publish a new release. Existing users then update their Sileo source.

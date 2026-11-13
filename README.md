@@ -138,7 +138,7 @@ slipstream-ios/
 ├── provider/                 # NEAppProxyProvider extension
 ├── src/                      # Rust relay engine, management API, iOS configuration
 ├── patches/                  # iOS patches for the pinned tun2proxy
-├── scripts/                  # build, package, install, slipstreamctl
+├── scripts/                  # build, package, slipstreamctl
 ├── packaging/                # maintainer scripts, entitlements, signing key
 ├── tests/                    # host tests, package check, on-device audits
 └── docs/                     # architecture, validation records, research
@@ -170,8 +170,8 @@ xcrun simctl install booted build/simulator/Slipstream.app
 SIMCTL_CHILD_SLIPSTREAM_PREVIEW=selected xcrun simctl launch booted local.slipstream.app
 ```
 
-`SLIPSTREAM_PREVIEW` takes `empty`, `off`, `blocked`, `protected`, `selected`,
-or `socks5`; `SLIPSTREAM_PREVIEW_SHEET` opens `import`, `apps`, `lists`, or
+`SLIPSTREAM_PREVIEW` takes `empty`, `off`, `protected`, `starting`, `unavailable`,
+`selected`, or `socks5`; `SLIPSTREAM_PREVIEW_SHEET` opens `import`, `apps`, `lists`, or
 `help`.
 
 ## Development

@@ -2,23 +2,8 @@
 set -eu
 PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
-base=/var/jb
-bin=$base/usr/local/bin/slipstream
 case "${1:-status}" in
- enable|disable|restart|status) exec "$bin" "${1:-status}" ;;
- uninstall)
-  if dpkg-query -W -f='${Status}' io.github.10.slipstream 2>/dev/null | grep -q 'install ok installed'; then
-   exec apt-get remove io.github.10.slipstream
-  fi
-  "$bin" disable
-  uicache -u "$base/Applications/Slipstream.app"
-  rm -rf "$base/Applications/Slipstream.app"
-  rm -f "$bin" "$base/usr/local/bin/slipstreamctl"
-  for name in config.json proxies.json app-routing.json enabled control.lock tunnel.uuid; do
-   rm -f "$base/etc/slipstream/$name" "$base/etc/slipstream/$name.new"
-  done
-  rmdir "$base/etc/slipstream" 2>/dev/null || true
-  echo 'uninstalled; diagnostic captures are retained in /var/jb/var/run/slipstream'
-  ;;
+ enable|disable|restart|status) exec /var/jb/usr/local/bin/slipstream "${1:-status}" ;;
+ uninstall) exec apt-get remove io.github.10.slipstream ;;
  *) echo 'usage: slipstreamctl enable|disable|restart|status|uninstall' >&2; exit 2 ;;
 esac

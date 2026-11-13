@@ -1,4 +1,4 @@
-//! Saved lists in root-only storage; control.rs exposes them to the authorized app.
+//! Saved proxy lists and the selected proxy, stored root-only on the phone.
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::Ipv4Addr};
 
@@ -26,6 +26,7 @@ pub struct Proxy {
 }
 
 impl Proxy {
+    /// The proxy as the engine reads it, with percent-encoded credentials.
     pub fn url(&self) -> String {
         let scheme = match self.kind {
             ProxyKind::Http => "http",
@@ -37,30 +38,6 @@ impl Proxy {
             let key = tun2proxy::UserKey::new(&self.username, &self.password);
             format!("{scheme}://{key}@{}:{}", self.host, self.port)
         }
-    }
-    pub fn from_url(url: &str) -> Result<Self, String> {
-        let p = tun2proxy::ArgProxy::try_from(url)
-            .map_err(|_| "Saved proxy configuration is invalid.")?;
-        let kind = match p.proxy_type {
-            tun2proxy::ProxyType::Http => ProxyKind::Http,
-            tun2proxy::ProxyType::Socks5 => ProxyKind::Socks5,
-            _ => return Err("Use an HTTP or SOCKS5 proxy.".into()),
-        };
-        let std::net::IpAddr::V4(host) = p.addr.ip() else {
-            return Err("Use an IPv4 proxy address.".into());
-        };
-        let (username, password) = p
-            .credentials
-            .map(|c| (c.username, c.password))
-            .unwrap_or_default();
-        Ok(Self {
-            id: 0,
-            host,
-            port: p.addr.port(),
-            username,
-            password,
-            kind,
-        })
     }
 }
 
@@ -92,11 +69,58 @@ impl Library {
             .flat_map(|g| &g.proxies)
             .find(|p| p.id == id)
     }
-    pub fn add(&mut self, name: &str, entries: Vec<Proxy>) -> Result<usize, String> {
-        let name = name.trim();
-        if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
-            return Err("Use a list name of 1–40 characters.".into());
+    pub fn selected_proxy(&self) -> Option<&Proxy> {
+        self.selected.and_then(|id| self.get(id))
+    }
+    pub fn select(&mut self, id: u64) -> Result<(), String> {
+        self.get(id)
+            .ok_or("This proxy is no longer saved. Refresh the list.")?;
+        self.selected = Some(id);
+        Ok(())
+    }
+    pub fn list(&self, id: u64) -> Option<&ProxyList> {
+        self.lists.iter().find(|g| g.id == id)
+    }
+    /// Removes a proxy, and the selection with it.
+    pub fn remove_proxy(&mut self, id: u64) {
+        for group in &mut self.lists {
+            group.proxies.retain(|p| p.id != id);
         }
+        if self.selected == Some(id) {
+            self.selected = None;
+        }
+    }
+    pub fn list_holds_selection(&self, id: u64) -> bool {
+        self.list(id)
+            .is_some_and(|g| g.proxies.iter().any(|p| Some(p.id) == self.selected))
+    }
+    /// Removes a list, and the selection when the list holds it.
+    pub fn remove_list(&mut self, id: u64) {
+        if self.list_holds_selection(id) {
+            self.selected = None;
+        }
+        self.lists.retain(|g| g.id != id);
+    }
+    pub fn rename_list(&mut self, id: u64, name: &str) -> Result<(), String> {
+        let name = list_name(name)?;
+        if self
+            .lists
+            .iter()
+            .any(|g| g.id != id && g.name.to_lowercase() == name.to_lowercase())
+        {
+            return Err("A list with this name already exists.".into());
+        }
+        self.lists
+            .iter_mut()
+            .find(|g| g.id == id)
+            .ok_or("This list is no longer saved.")?
+            .name = name.into();
+        Ok(())
+    }
+    /// Adds proxies to the list with this name, creating it when needed. Proxies already in that
+    /// list are skipped; returns how many were added.
+    pub fn add(&mut self, name: &str, entries: Vec<Proxy>) -> Result<usize, String> {
+        let name = list_name(name)?;
         let group = self
             .lists
             .iter()
@@ -135,6 +159,14 @@ impl Library {
         }
         Ok(count)
     }
+}
+
+fn list_name(name: &str) -> Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
+        return Err("Use a list name of 1–40 characters.".into());
+    }
+    Ok(name)
 }
 
 pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
@@ -199,12 +231,26 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy as the engine parses its URL.
+    fn engine_view(p: &Proxy) -> (tun2proxy::ProxyType, String, String, String) {
+        let parsed = tun2proxy::ArgProxy::try_from(p.url().as_str()).unwrap();
+        let key = parsed.credentials.unwrap_or_default();
+        (parsed.proxy_type, parsed.addr.to_string(), key.username, key.password)
+    }
+
     #[test]
     fn import_is_strict_private_and_round_trips_credentials() {
-        let entries=parse_list("\u{feff}203.0.113.1:3128:user:p@ss:word\r\n\n203.0.113.1:3128:user:p@ss:word\n198.51.100.2:80", ProxyKind::Http).unwrap();
+        let entries = parse_list(
+            "\u{feff}203.0.113.1:3128:user:p@ss:word\r\n\n203.0.113.1:3128:user:p@ss:word\n198.51.100.2:80",
+            ProxyKind::Http,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(Proxy::from_url(&entries[0].url()).unwrap() == entries[0]);
-        assert!(entries[0].url().starts_with("http://"));
+        assert_eq!(
+            engine_view(&entries[0]),
+            (tun2proxy::ProxyType::Http, "203.0.113.1:3128".into(), "user".into(), "p@ss:word".into())
+        );
         for bad in [
             "example.org:80",
             "0.0.0.0:80",
@@ -219,10 +265,10 @@ mod tests {
         }
         let mut library = Library::default();
         assert_eq!(library.add("Work", entries.clone()).unwrap(), 2);
-        library.selected = Some(library.lists[0].proxies[0].id);
+        library.select(library.lists[0].proxies[0].id).unwrap();
         assert_eq!(library.add("work", entries).unwrap(), 0);
         assert_eq!(library.lists.len(), 1);
-        assert!(library.get(library.selected.unwrap()).is_some());
+        assert!(library.selected_proxy().is_some());
         assert!(library.add("", vec![]).is_err());
     }
 
@@ -231,11 +277,7 @@ mod tests {
         let socks = parse_list("203.0.113.1:1080:user:pass\n203.0.113.2:1080", ProxyKind::Socks5).unwrap();
         assert_eq!(socks[0].url(), "socks5://user:pass@203.0.113.1:1080");
         assert_eq!(socks[1].url(), "socks5://203.0.113.2:1080");
-        for p in &socks {
-            let parsed = Proxy::from_url(&p.url()).unwrap();
-            assert!(parsed == *p && parsed.kind == ProxyKind::Socks5);
-        }
-        assert!(Proxy::from_url("socks4://203.0.113.1:1080").is_err());
+        assert_eq!(engine_view(&socks[1]).0, tun2proxy::ProxyType::Socks5);
         // The same endpoint may be saved once per protocol.
         let http = parse_list("203.0.113.1:1080:user:pass", ProxyKind::Http).unwrap();
         let mut library = Library::default();
@@ -245,5 +287,24 @@ mod tests {
         assert_eq!(legacy.kind, ProxyKind::Http);
         let saved = serde_json::to_string(&library.lists[0].proxies[0]).unwrap();
         assert!(saved.contains(r#""type":"socks5""#));
+    }
+
+    #[test]
+    fn removing_the_selected_proxy_or_its_list_clears_the_selection() {
+        let mut library = Library::default();
+        library.add("Home", parse_list("203.0.113.1:80\n203.0.113.2:80", ProxyKind::Http).unwrap()).unwrap();
+        library.add("Away", parse_list("203.0.113.3:80", ProxyKind::Http).unwrap()).unwrap();
+        let [home, away] = [library.lists[0].id, library.lists[1].id];
+        let first = library.lists[0].proxies[0].id;
+        library.select(first).unwrap();
+        library.remove_list(away);
+        assert_eq!(library.selected, Some(first));
+        library.remove_proxy(first);
+        assert_eq!(library.selected, None);
+        library.select(library.lists[0].proxies[0].id).unwrap();
+        assert!(library.rename_list(home, " Office ").is_ok());
+        assert_eq!(library.lists[0].name, "Office");
+        library.remove_list(home);
+        assert!(library.selected.is_none() && library.lists.is_empty());
     }
 }

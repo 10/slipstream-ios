@@ -1,4 +1,4 @@
-// Installed application names, isolated from the native tunnel configuration.
+// Installed apps: names, whether they are hidden, and whether a per-app rule can protect them.
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -38,7 +38,7 @@ char *slipstream_app_catalog(void) { @autoreleasepool { @try {
         id rule=[[NSClassFromString(@"NEAppRule") alloc]initWithSigningIdentifier:bundle];
         BOOL required=YES;
         BOOL allowed=[rule respondsToSelector:@selector(signingIdentifierAllowed:domainsOrAccountsRequired:)] && [rule signingIdentifierAllowed:bundle domainsOrAccountsRequired:&required];
-        [apps addObject:@{@"id":bundle,@"name":name.length?name:bundle,@"hidden":@(hidden(app)),@"requires_all":@((BOOL)(required || !allowed))}];
+        [apps addObject:@{@"id":bundle,@"name":name.length?name:bundle,@"hidden":@(hidden(app)),@"requires_domains":@((BOOL)(required || !allowed))}];
     }
     NSData *json=[NSJSONSerialization dataWithJSONObject:apps options:0 error:nil];
     return json?strndup(json.bytes,json.length):NULL;

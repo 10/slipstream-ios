@@ -53,7 +53,6 @@ jobs:
           cargo test --locked --lib
           cargo test --locked -p tun2proxy --lib basic_auth_header_value
           python3 -m unittest discover -s tests -p 'test_*.py'
-          sh -n scripts/install.sh scripts/slipstreamctl packaging/maintainer.sh
           python3 scripts/release.py package "$SLIPSTREAM_VERSION"
           SLIPSTREAM_SCHEME=rootful ./scripts/build.sh
           python3 scripts/release.py package "$SLIPSTREAM_VERSION"
@@ -62,7 +61,6 @@ jobs:
         env:
           GNUPGHOME: ${{ runner.temp }}/slipstream-gnupg
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
-          REPO_URL: https://10.github.io/slipstream-ios/
         run: |
           mkdir -m 700 "$GNUPGHOME"
           printf '%s' "$APT_SIGNING_KEY" | gpg --batch --import
@@ -73,7 +71,7 @@ jobs:
           gh release list --limit 100 --json tagName,isDraft --jq '.[] | select(.isDraft | not) | .tagName' |
             while read -r tag; do gh release download "$tag" --pattern '*.deb' --dir build/published; done
           shopt -s nullglob
-          python3 scripts/release.py repository "$REPO_URL" build/repository build/published/*.deb build/io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb --signing-key "$key"
+          python3 scripts/release.py repository build/repository build/published/*.deb build/io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb --signing-key "$key"
           gpg --batch --verify build/repository/Release.gpg build/repository/Release
           cd build
           shasum -a 256 io.github.10.slipstream_"$SLIPSTREAM_VERSION"_*.deb > SHA256SUMS

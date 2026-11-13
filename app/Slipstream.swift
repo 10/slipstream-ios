@@ -1,32 +1,33 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct SavedProxy: Codable, Identifiable, Equatable {
+enum ProxyKind: String, Codable { case http, socks5 }
+struct SavedProxy: Decodable, Identifiable, Equatable {
     var id: UInt64
     var host: String
     var port: Int
     var username: String
     var password: String
-    var type: String? = nil
-    var isSocks5: Bool { type == "socks5" }
+    var type = ProxyKind.http
     var address: String { "\(host):\(port)" }
     var credentials: String { username.isEmpty ? "" : "\(username):\(password)" }
     var line: String { credentials.isEmpty ? address : "\(address):\(credentials)" }
 }
-struct SavedList: Codable, Identifiable {
+struct SavedList: Decodable, Identifiable {
     var id: UInt64
     var name: String
     var proxies: [SavedProxy]
 }
+enum RoutingMode: String, Codable { case all, selected }
 struct AppRouting: Codable, Equatable {
-    var mode = "all"
+    var mode = RoutingMode.all
     var bundle_ids: [String] = []
-    var summary: String { mode == "all" ? "All apps" : "\(bundle_ids.count) selected" }
+    var summary: String { mode == .all ? "All apps" : "\(bundle_ids.count) selected" }
 }
 struct InstalledApp: Decodable, Identifiable {
     var id: String
     var name: String
-    var requires_all = false
+    var requires_domains = false
 }
 /// An installed app's Home Screen icon. UIKit's private icon lookup can read other apps' icons
 /// because this app is not sandboxed; where it is missing, a neutral tile stands in.
@@ -54,31 +55,179 @@ struct AppIcon: View {
         .accessibilityHidden(true)
     }
 }
-struct Snapshot: Codable {
-    var state: String
+enum ProtectionState: String, Decodable { case protected, starting, unavailable, disabled }
+struct Snapshot: Decodable {
+    var state: ProtectionState
     var enabled: Bool
     var selected: UInt64?
     var network: String?
     var lists: [SavedList]
-    var app_routing: AppRouting? = nil
-    var appRouting: AppRouting { app_routing ?? AppRouting() }
+    var app_routing: AppRouting
     var proxy: SavedProxy? { lists.flatMap(\.proxies).first { $0.id == selected } }
+}
+enum UDPRelay: String, Decodable {
+    case relayed, unsupported, blocked
+    var label: String {
+        switch self {
+        case .relayed: return "Relayed"
+        case .unsupported: return "Not relayed"
+        case .blocked: return "Blocked"
+        }
+    }
 }
 struct Reply: Decodable {
     var ok: Bool
-    var snapshot: Snapshot?
-    var message: String?
-    var latency_ms: UInt64?
-    var udp: String?
-    var apps: [InstalledApp]?
+    var snapshot: Snapshot? = nil
+    var message: String? = nil
+    var latency_ms: UInt64? = nil
+    var udp: UDPRelay? = nil
+    var apps: [InstalledApp]? = nil
 }
 
+/// Every request the app sends, as the root service's `Request` names them.
+enum Request: Encodable {
+    case status, apps, enable, disable, restart
+    case setAppRouting(AppRouting)
+    case testConnection(id: UInt64)
+    case importList(name: String, type: ProxyKind, text: String)
+    case select(id: UInt64)
+    case deleteProxy(id: UInt64)
+    case deleteList(id: UInt64)
+    case renameList(id: UInt64, name: String)
+
+    /// Shown while a change runs; nil for requests that only read.
+    var progress: String? {
+        switch self {
+        case .enable: return "Enabling…"
+        case .disable: return "Disabling…"
+        case .restart: return "Restarting…"
+        case .setAppRouting: return "Saving…"
+        case .importList: return "Importing proxies…"
+        case .select: return "Switching…"
+        case .deleteProxy: return "Removing proxy…"
+        case .deleteList: return "Deleting list…"
+        case .renameList: return "Renaming list…"
+        case .status, .apps, .testConnection: return nil
+        }
+    }
+    /// The connection may now use another proxy or route other apps.
+    var changesConnection: Bool {
+        switch self {
+        case .enable, .disable, .restart, .select, .setAppRouting: return true
+        default: return false
+        }
+    }
+
+    private enum Key: String, CodingKey { case action, routing, id, name, type, text }
+    func encode(to encoder: Encoder) throws {
+        var json = encoder.container(keyedBy: Key.self)
+        switch self {
+        case .status: try json.encode("status", forKey: .action)
+        case .apps: try json.encode("apps", forKey: .action)
+        case .enable: try json.encode("enable", forKey: .action)
+        case .disable: try json.encode("disable", forKey: .action)
+        case .restart: try json.encode("restart", forKey: .action)
+        case .setAppRouting(let routing):
+            try json.encode("set_app_routing", forKey: .action); try json.encode(routing, forKey: .routing)
+        case .testConnection(let id):
+            try json.encode("test_connection", forKey: .action); try json.encode(id, forKey: .id)
+        case .importList(let name, let type, let text):
+            try json.encode("import", forKey: .action); try json.encode(name, forKey: .name)
+            try json.encode(type, forKey: .type); try json.encode(text, forKey: .text)
+        case .select(let id): try json.encode("select", forKey: .action); try json.encode(id, forKey: .id)
+        case .deleteProxy(let id): try json.encode("delete_proxy", forKey: .action); try json.encode(id, forKey: .id)
+        case .deleteList(let id): try json.encode("delete_list", forKey: .action); try json.encode(id, forKey: .id)
+        case .renameList(let id, let name):
+            try json.encode("rename_list", forKey: .action); try json.encode(id, forKey: .id); try json.encode(name, forKey: .name)
+        }
+    }
+}
+
+/// Where requests go: the root service on the phone, or labeled preview data in the simulator.
+protocol Service: Sendable {
+    func send(_ request: Request) async throws -> Reply
+    /// The public address the protected path reaches the Internet from.
+    func exitIP() async -> String?
+}
+
+/// The root service, through the setuid helper. It holds a lock per request and refuses
+/// overlapping ones, so this actor sends one at a time.
+actor PhoneService: Service {
+    func send(_ request: Request) throws -> Reply {
+        let text = String(decoding: try JSONEncoder().encode(request), as: UTF8.self)
+        guard let response = text.withCString({ slipstream_request($0) }) else { throw URLError(.cannotConnectToHost) }
+        defer { free(response) }
+        return try JSONDecoder().decode(Reply.self, from: Data(String(cString: response).utf8))
+    }
+    nonisolated func exitIP() async -> String? {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 15
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        guard let (data, response): (Data, URLResponse) = try? await withCheckedThrowingContinuation({ result in
+            session.dataTask(with: URL(string: "https://api.ipify.org?format=json")!) { data, response, error in
+                if let data = data, let response = response { result.resume(returning: (data, response)) }
+                else { result.resume(throwing: error ?? URLError(.badServerResponse)) }
+            }.resume()
+        }) else { return nil }
+        struct IPResponse: Decodable { var ip: String }
+        guard (response as? HTTPURLResponse)?.statusCode == 200, data.count < 512,
+              let ip = try? JSONDecoder().decode(IPResponse.self, from: data).ip else { return nil }
+        var ipv4 = in_addr(), ipv6 = in6_addr()
+        return inet_pton(AF_INET, ip, &ipv4) == 1 || inet_pton(AF_INET6, ip, &ipv6) == 1 ? ip : nil
+    }
+}
+
+#if targetEnvironment(simulator)
+/// Labeled preview data for UI work. `SLIPSTREAM_PREVIEW` picks the starting state: `empty`,
+/// `off`, `protected`, `starting`, `unavailable`, `selected` or `socks5`.
+actor PreviewService: Service {
+    private let environment: [String: String]
+    private var snapshot: Snapshot
+    init() {
+        let environment = ProcessInfo.processInfo.environment
+        self.environment = environment
+        let mode = environment["SLIPSTREAM_PREVIEW"] ?? "protected"
+        let proxies = (0..<6).map { SavedProxy(id: UInt64($0 + 2), host: "198.51.100.\(42 + $0)", port: 3128, username: "example_user", password: "example_pass:\($0)") }
+        let socks = [SavedProxy(id: 11, host: "203.0.113.18", port: 1080, username: "example_user", password: "example_pass", type: .socks5), SavedProxy(id: 12, host: "203.0.113.19", port: 1080, username: "", password: "", type: .socks5)]
+        let lists = mode == "empty" ? [] : [SavedList(id: 1, name: "Everyday", proxies: proxies), SavedList(id: 10, name: "Travel", proxies: socks)]
+        let state: ProtectionState = mode == "empty" || mode == "off" ? .disabled : mode == "selected" || mode == "socks5" ? .protected : ProtectionState(rawValue: mode) ?? .protected
+        snapshot = Snapshot(state: state, enabled: mode != "empty" && mode != "off", selected: mode == "empty" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists,
+                            app_routing: mode == "selected" ? AppRouting(mode: .selected, bundle_ids: ["com.burbn.instagram", "com.google.ios.youtube"]) : AppRouting())
+    }
+    func send(_ request: Request) -> Reply {
+        switch request {
+        case .apps:
+            return Reply(ok: true, apps: [InstalledApp(id: "com.burbn.instagram", name: "Instagram"), InstalledApp(id: "com.zhiliaoapp.musically", name: "TikTok"), InstalledApp(id: "com.google.ios.youtube", name: "YouTube")])
+        case .testConnection:
+            let udp = environment["SLIPSTREAM_PREVIEW_UDP"].flatMap(UDPRelay.init) ?? (snapshot.proxy?.type == .socks5 ? .relayed : .blocked)
+            return Reply(ok: true, snapshot: snapshot, latency_ms: 42, udp: udp)
+        case .importList:
+            return Reply(ok: true, snapshot: snapshot, message: "Preview only. Import is verified on the iPhone.")
+        case .select(let id): snapshot.selected = id; snapshot.enabled = true; snapshot.state = .protected
+        case .enable, .restart: snapshot.enabled = true; snapshot.state = .protected
+        case .disable: snapshot.enabled = false; snapshot.state = .disabled
+        case .setAppRouting(let routing): snapshot.app_routing = routing
+        case .status, .deleteProxy, .deleteList, .renameList: break
+        }
+        return Reply(ok: true, snapshot: snapshot)
+    }
+    func exitIP() -> String? { "203.0.113.42" }
+}
+#endif
+
+/// The logo's blue: #0065F0 in light appearance, #4D97FF in dark, each at least 4.5:1 against
+/// the grouped surfaces it is drawn on.
 let slipstreamUITint = UIColor { trait in
     trait.userInterfaceStyle == .dark
-        ? UIColor(red: 0.37, green: 0.85, blue: 0.82, alpha: 1)
-        : UIColor(red: 0, green: 0.46, blue: 0.44, alpha: 1)
+        ? UIColor(red: 0.302, green: 0.592, blue: 1, alpha: 1)
+        : UIColor(red: 0, green: 0.396, blue: 0.941, alpha: 1)
 }
 let slipstreamTint = Color(slipstreamUITint)
+/// Labels on a tint fill. White on the dark-appearance blue would fall below 3:1.
+let slipstreamOnTint = Color(UIColor { $0.userInterfaceStyle == .dark ? .black : .white })
 
 @MainActor final class TunnelModel: ObservableObject {
     @Published var snapshot: Snapshot?
@@ -88,42 +237,34 @@ let slipstreamTint = Color(slipstreamUITint)
     @Published var checking = false
     @Published var exitIP: String?
     @Published var latencyMS: UInt64?
-    @Published var udp: String?
+    @Published var udp: UDPRelay?
     @Published var checkedAt: Date?
-    private var refreshing = false
+    #if targetEnvironment(simulator)
+    private let service: Service = PreviewService()
+    #else
+    private let service: Service = PhoneService()
+    #endif
+    private var refreshing: Task<Void, Never>?
     private var refreshError = false
+    /// Bumped whenever protection or its settings may have changed, so an older check is dropped.
     private var revision = 0
     var busy: Bool { operation != nil || checking }
-    var protected: Bool { snapshot?.state == "protected" }
+    var protected: Bool { snapshot?.state == .protected }
 
-    private func request(_ payload: [String: Any]) async throws -> Reply {
-        let data = try JSONSerialization.data(withJSONObject: payload)
-        let text = String(decoding: data, as: UTF8.self)
-        return try await Task.detached(priority: .userInitiated) {
-            guard let response = text.withCString({ slipstream_request($0) }) else { throw URLError(.cannotConnectToHost) }
-            defer { free(response) }
-            return try JSONDecoder().decode(Reply.self, from: Data(String(cString: response).utf8))
-        }.value
+    /// Reads the current state; callers during a refresh share it.
+    func refresh() async {
+        guard operation == nil else { return }
+        if let refreshing = refreshing { return await refreshing.value }
+        let task = Task { await readStatus() }
+        refreshing = task
+        await task.value
+        refreshing = nil
     }
-
-    func refresh(allowDuringCheck: Bool = false) async {
-        guard operation == nil, (!checking || allowDuringCheck), !refreshing else { return }
-        refreshing = true
-        defer { refreshing = false }
-        #if targetEnvironment(simulator)
-        if snapshot == nil {
-            let mode = ProcessInfo.processInfo.environment["SLIPSTREAM_PREVIEW"] ?? "protected"
-            let proxies = (0..<6).map { SavedProxy(id: UInt64($0 + 2), host: "198.51.100.\(42 + $0)", port: 3128, username: "example_user", password: "example_pass:\($0)") }
-            let socks = [SavedProxy(id: 11, host: "203.0.113.18", port: 1080, username: "example_user", password: "example_pass", type: "socks5"), SavedProxy(id: 12, host: "203.0.113.19", port: 1080, username: "", password: "", type: "socks5")]
-            let lists = mode == "empty" ? [] : [SavedList(id: 1, name: "Everyday", proxies: proxies), SavedList(id: 10, name: "Travel", proxies: socks)]
-            snapshot = Snapshot(state: mode == "empty" || mode == "off" ? "disabled" : mode == "selected" || mode == "socks5" ? "protected" : mode, enabled: mode != "empty" && mode != "off", selected: mode == "empty" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists, app_routing: mode == "selected" ? AppRouting(mode: "selected", bundle_ids: ["com.burbn.instagram", "com.google.ios.youtube"]) : AppRouting())
-        }
-        return
-        #else
+    private func readStatus() async {
         do {
-            let result = try await request(["action": "status"])
+            let result = try await service.send(.status)
             if let updated = result.snapshot {
-                if snapshot?.selected != updated.selected || snapshot?.state != updated.state || snapshot?.appRouting != updated.appRouting {
+                if snapshot?.selected != updated.selected || snapshot?.state != updated.state || snapshot?.app_routing != updated.app_routing {
                     revision += 1
                     clearCheck()
                 }
@@ -143,113 +284,61 @@ let slipstreamTint = Color(slipstreamUITint)
             snapshot = nil
             clearCheck()
         }
-        #endif
     }
 
-    @discardableResult func perform(_ payload: [String: Any], label: String) async -> Bool {
-        guard !busy else { return false }
-        operation = label
-        while refreshing { try? await Task.sleep(nanoseconds: 50_000_000) }
+    /// Runs a change and, when it changed a connection that stays on, checks the connection again.
+    @discardableResult func perform(_ request: Request) async -> Bool {
+        guard !busy, let progress = request.progress else { return false }
+        operation = progress
+        await refreshing?.value
         error = nil
         refreshError = false
         notice = nil
-        revision += 1
-        clearCheck()
+        if request.changesConnection {
+            revision += 1
+            clearCheck()
+        }
         var success = false
         let background = UIApplication.shared.beginBackgroundTask(withName: "Update Slipstream")
         defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
-        #if targetEnvironment(simulator)
-        success = previewPerform(payload)
-        #else
         do {
-            let result = try await request(payload)
+            let result = try await service.send(request)
             if let updated = result.snapshot { snapshot = updated }
             success = result.ok
             if result.ok { notice = result.message }
             else { error = result.message ?? "The change could not be completed. Retry." }
         } catch { self.error = "The service did not return a result. Refresh to check protection before retrying." }
-        #endif
         operation = nil
         if !success { await refresh() }
         UIAccessibility.post(notification: .announcement, argument: success ? (notice ?? "Updated") : error)
+        if success && protected && request.changesConnection { Task { await checkConnection() } }
         return success
     }
 
     func installedApps() async throws -> [InstalledApp] {
-        #if targetEnvironment(simulator)
-        return [InstalledApp(id: "com.burbn.instagram", name: "Instagram"), InstalledApp(id: "com.google.ios.youtube", name: "YouTube"), InstalledApp(id: "com.zhiliaoapp.musically", name: "TikTok")].sorted { $0.name < $1.name }
-        #else
-        let reply = try await request(["action": "apps"])
+        let reply = try await service.send(.apps)
         guard reply.ok, let apps = reply.apps else { throw URLError(.cannotLoadFromNetwork) }
         return apps
-        #endif
     }
     private func clearCheck() { exitIP = nil; latencyMS = nil; udp = nil; checkedAt = nil }
     func checkConnection() async {
         guard protected, !busy else { return }
         checking = true
         defer { checking = false }
-        while refreshing {
-            do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
-        }
+        await refreshing?.value
         guard protected, let selected = snapshot?.selected else { return }
         let currentRevision = revision
         clearCheck()
-        #if targetEnvironment(simulator)
-        exitIP = "203.0.113.42"; latencyMS = 42; checkedAt = Date()
-        let preview = ProcessInfo.processInfo.environment
-        udp = preview["SLIPSTREAM_PREVIEW_UDP"] ?? (snapshot?.proxy?.isSocks5 == true ? "relayed" : "blocked")
-        return
-        #else
-        let latency = try? await request(["action": "test_connection", "id": selected])
-        var resultIP: String?
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 12
-        configuration.timeoutIntervalForResource = 15
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: configuration)
-        defer { session.invalidateAndCancel() }
-        do {
-            let (data, response): (Data, URLResponse) = try await withCheckedThrowingContinuation { result in
-                session.dataTask(with: URL(string: "https://api.ipify.org?format=json")!) { data, response, error in
-                    if let data = data, let response = response { result.resume(returning: (data, response)) }
-                    else { result.resume(throwing: error ?? URLError(.badServerResponse)) }
-                }.resume()
-            }
-            struct IPResponse: Decodable { var ip: String }
-            if (response as? HTTPURLResponse)?.statusCode == 200, data.count < 512 {
-                let ip = try JSONDecoder().decode(IPResponse.self, from: data).ip
-                var ipv4 = in_addr(), ipv6 = in6_addr()
-                if inet_pton(AF_INET, ip, &ipv4) == 1 || inet_pton(AF_INET6, ip, &ipv6) == 1 { resultIP = ip }
-            }
-        } catch { /* A failed check never changes routing or disables protection. */ }
-        await refresh(allowDuringCheck: true)
+        let check = try? await service.send(.testConnection(id: selected))
+        // A failed check never changes routing or disables protection.
+        let resultIP = await service.exitIP()
+        await refresh()
         guard currentRevision == revision, protected else { return }
         checkedAt = Date()
         exitIP = resultIP
-        latencyMS = latency?.ok == true ? latency?.latency_ms : nil
-        udp = latency?.ok == true ? latency?.udp : nil
-        #endif
+        latencyMS = check?.ok == true ? check?.latency_ms : nil
+        udp = check?.ok == true ? check?.udp : nil
     }
-
-    #if targetEnvironment(simulator)
-    private func previewPerform(_ payload: [String: Any]) -> Bool {
-        guard var value = snapshot, let action = payload["action"] as? String else { return false }
-        switch action {
-        case "select": value.selected = payload["id"] as? UInt64; value.enabled = true; value.state = "protected"
-        case "enable", "restart": value.enabled = true; value.state = "protected"
-        case "disable": value.enabled = false; value.state = "disabled"
-        case "set_app_routing":
-            if let routing = payload["routing"] as? [String: Any] {
-                value.app_routing = AppRouting(mode: routing["mode"] as? String ?? "all", bundle_ids: routing["bundle_ids"] as? [String] ?? [])
-            }
-        case "import": notice = "Preview only. Import is verified on the iPhone."
-        default: break
-        }
-        snapshot = value
-        return true
-    }
-    #endif
 }
 
 @main struct SlipstreamApp: App {
@@ -267,8 +356,13 @@ let slipstreamTint = Color(slipstreamUITint)
                     if phase != .active {
                         ZStack {
                             Color(.systemBackground).ignoresSafeArea()
-                            Label("Slipstream", systemImage: "point.3.connected.trianglepath.dotted")
-                                .font(.title2.weight(.semibold)).foregroundColor(slipstreamTint)
+                            VStack(spacing: 12) {
+                                if let icon = UIImage(named: "Icon60") {
+                                    Image(uiImage: icon).resizable().frame(width: 60, height: 60)
+                                        .clipShape(RoundedRectangle(cornerRadius: 13.5, style: .continuous))
+                                }
+                                Text("Slipstream").font(.title2.weight(.semibold))
+                            }
                         }.accessibilityHidden(true)
                     }
                 })
@@ -301,7 +395,7 @@ struct HomeView: View {
                 protection
                 if let error = model.error {
                     Section {
-                        Label { Text(error).font(.subheadline) } icon: { WarningSymbol() }
+                        ErrorLabel(message: error)
                         Button("Refresh Status") { Task { await model.refresh() } }.disabled(model.busy)
                     }
                 }
@@ -331,7 +425,7 @@ struct HomeView: View {
                             Image(systemName: "tray.and.arrow.down").font(.largeTitle).imageScale(.large)
                                 .foregroundColor(.secondary).padding(.bottom, 4).accessibilityHidden(true)
                             Text("No Proxies").font(.title2.weight(.semibold))
-                            Text("Import a list to choose a proxy.").font(.subheadline).foregroundColor(.secondary)
+                            Text("Import a list to choose a proxy").font(.subheadline).foregroundColor(.secondary)
                             Button("Import Proxies") { importing = true }.prominent().padding(.top, 12)
                         }.multilineTextAlignment(.center).frame(maxWidth: .infinity).padding(.vertical, 24)
                     }.listRowBackground(Color.clear)
@@ -382,7 +476,7 @@ struct HomeView: View {
             .destination(isPresented: $showingApps) { AppsView(model: model) }
             .sheet(isPresented: $showingHelp) { HelpView().appTint() }
             .confirmation("Remove this proxy?", item: $pendingDelete, label: { "Remove \($0.address)" }) { proxy in
-                Task { await model.perform(["action": "delete_proxy", "id": proxy.id], label: "Removing proxy…") }
+                Task { await model.perform(.deleteProxy(id: proxy.id)) }
             }
             .onChange(of: groups.map(\.id)) { ids in if listID != 0 && !ids.contains(listID) { listID = 0 } }
             #if targetEnvironment(simulator)
@@ -418,7 +512,7 @@ struct HomeView: View {
                      MenuItem(title: "Help", symbol: "info.circle") { showingHelp = true }]
         if model.snapshot?.enabled == true {
             items.append(MenuItem(title: "Restart Connection", symbol: "arrow.clockwise") {
-                Task { if await model.perform(["action": "restart"], label: "Restarting…") { await model.checkConnection() } }
+                Task { await model.perform(.restart) }
             })
         }
         return items
@@ -440,13 +534,13 @@ struct HomeView: View {
                 Toggle("Protection", isOn: Binding(get: {
                     model.snapshot?.enabled == true
                 }, set: { enabled in
-                    Task { if await model.perform(["action": enabled ? "enable" : "disable"], label: enabled ? "Enabling…" : "Disabling…"), enabled { await model.checkConnection() } }
+                    Task { await model.perform(enabled ? .enable : .disable) }
                 }))
                 .labelsHidden().disabled(model.busy || model.snapshot == nil || (model.snapshot?.selected == nil && model.snapshot?.enabled != true))
                 .accessibilityLabel("Protection").accessibilityIdentifier("protectionToggle")
             }.padding(.vertical, 6)
             if let proxy = model.snapshot?.proxy {
-                DetailRow(label: "Proxy", caption: proxy.isSocks5 ? "SOCKS5" : nil) {
+                DetailRow(label: "Proxy", caption: proxy.type == .socks5 ? "SOCKS5" : nil) {
                     Text(proxy.address).font(.system(.body, design: .monospaced)).selectableText()
                 }
             }
@@ -454,7 +548,7 @@ struct HomeView: View {
                 HStack {
                     Text("Apps").foregroundColor(.primary)
                     Spacer()
-                    Text(model.snapshot?.appRouting.summary ?? "All apps").foregroundColor(.secondary)
+                    Text(model.snapshot?.app_routing.summary ?? "All apps").foregroundColor(.secondary)
                     Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).foregroundColor(Color(.tertiaryLabel))
                 }
             }.disabled(model.busy || model.snapshot == nil).accessibilityIdentifier("appRouting")
@@ -470,7 +564,7 @@ struct HomeView: View {
                         else { Label { Text("Check failed") } icon: { WarningSymbol() } }
                     }
                     DetailRow(label: "Latency") { Text(model.latencyMS.map { "\($0) ms" } ?? "Unavailable").font(Font.body.monospacedDigit()) }
-                    if let udp = udpValue { DetailRow(label: "UDP") { Text(udp) } }
+                    if let udp = model.udp { DetailRow(label: "UDP") { Text(udp.label) } }
                 }
                 Button { Task { await model.checkConnection() } } label: {
                     HStack {
@@ -481,27 +575,19 @@ struct HomeView: View {
                 }.disabled(model.checking).accessibilityIdentifier("testConnection")
             } header: { Text("Connection") } footer: {
                 if !model.checking, let date = model.checkedAt {
-                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))."
-                         + (model.udp == "unsupported" ? " This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""))
+                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))"
+                         + (model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""))
                 }
             }
         }
     }
-    private var udpValue: String? {
-        switch model.udp {
-        case "relayed": return "Relayed"
-        case "unsupported": return "Not relayed"
-        case "blocked": return "Blocked"
-        default: return nil
-        }
-    }
     private var statusTitle: String {
         switch model.snapshot?.state {
-        case "protected": return "Protected"
-        case "starting": return "Starting…"
-        case "unavailable": return "Protection unavailable"
-        case "disabled": return "Protection off"
-        default: return model.error == nil ? "Checking…" : "Status unavailable"
+        case .protected?: return "Protected"
+        case .starting?: return "Starting…"
+        case .unavailable?: return "Protection unavailable"
+        case .disabled?: return "Protection off"
+        case nil: return model.error == nil ? "Checking…" : "Status unavailable"
         }
     }
     private var statusSubtitle: String? {
@@ -511,23 +597,21 @@ struct HomeView: View {
     }
     private var statusSymbol: String {
         switch model.snapshot?.state {
-        case "protected": return "checkmark.shield.fill"
-        case "disabled": return "shield.slash"
-        case "starting": return "shield.lefthalf.fill"
-        default: return "exclamationmark.shield.fill"
+        case .protected?: return "checkmark.shield.fill"
+        case .disabled?: return "shield.slash"
+        case .starting?: return "shield.lefthalf.fill"
+        case .unavailable?, nil: return "exclamationmark.shield.fill"
         }
     }
     private var statusColor: Color {
         switch model.snapshot?.state {
-        case "protected", "starting": return slipstreamTint
-        case "disabled": return .secondary
-        default: return .orange
+        case .protected?, .starting?: return slipstreamTint
+        case .disabled?: return .secondary
+        case .unavailable?, nil: return .orange
         }
     }
-    private var typeBadge: some View {
-        Text("SOCKS5").font(.caption2.weight(.semibold)).foregroundColor(.secondary)
-            .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(Capsule().fill(Color(.tertiarySystemFill)))
+    private var typeMarker: some View {
+        Text("SOCKS5").font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
             .accessibilityLabel("SOCKS5 proxy")
     }
     /// Later versions filter lists from the toolbar; iOS 14 keeps an inline picker.
@@ -549,10 +633,9 @@ struct HomeView: View {
     }
     private func proxyRow(_ proxy: SavedProxy) -> some View {
         let selected = proxy.id == model.snapshot?.selected
-        return Button { Task { if await model.perform(["action": "select", "id": proxy.id], label: "Switching…") { await model.checkConnection() } } } label: {
+        return Button { Task { await model.perform(.select(id: proxy.id)) } } label: {
             HStack(spacing: 12) {
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .font(.title3).foregroundColor(selected ? slipstreamTint : Color(.tertiaryLabel))
+                SelectionMark(selected: selected)
                 VStack(alignment: .leading, spacing: 5) {
                     Text(proxy.address).font(.system(.body, design: .monospaced)).foregroundColor(.primary)
                     if !proxy.credentials.isEmpty {
@@ -561,7 +644,7 @@ struct HomeView: View {
                     }
                 }
                 Spacer(minLength: 0)
-                if proxy.isSocks5 { typeBadge }
+                if proxy.type == .socks5 { typeMarker }
             }.padding(.vertical, 4).frame(minHeight: 44).contentShape(Rectangle())
         }.buttonStyle(.plain).disabled(model.busy)
         .accessibilityElement(children: .combine)
@@ -575,7 +658,7 @@ struct ImportView: View {
     let suggestedName: String
     @Environment(\.presentationMode) private var presentation
     @State private var name = ""
-    @State private var type = "http"
+    @State private var type = ProxyKind.http
     @State private var text = ""
     @State private var filePicker = false
     @State private var localError: String?
@@ -583,16 +666,16 @@ struct ImportView: View {
         Navigation {
             Form {
                 if let error = localError {
-                    Section { Label { Text(error).font(.subheadline) } icon: { WarningSymbol() } }
+                    Section { ErrorLabel(message: error) }
                 }
                 Section {
                     TextField("List name", text: $name).autocapitalization(.words).disableAutocorrection(true).accessibilityIdentifier("listName")
                     Picker("Type", selection: $type) {
-                        Text("HTTP").tag("http")
-                        Text("SOCKS5").tag("socks5")
+                        Text("HTTP").tag(ProxyKind.http)
+                        Text("SOCKS5").tag(ProxyKind.socks5)
                     }.pickerStyle(.segmented).accessibilityIdentifier("proxyType")
                 } footer: {
-                    Text(type == "socks5" ? "SOCKS5 proxies can also relay UDP, such as calls and QUIC, when the proxy supports it." : "HTTP proxies carry TCP only. UDP is blocked.")
+                    Text(type == .socks5 ? "SOCKS5 proxies can also relay UDP, such as calls and QUIC, when the proxy supports it." : "HTTP proxies carry TCP only. UDP is blocked.")
                 }
                 Section {
                     ZStack(alignment: .topLeading) {
@@ -610,7 +693,7 @@ struct ImportView: View {
                     HStack(spacing: 12) {
                         if #available(iOS 16, *) {
                             PasteButton(payloadType: String.self) { values in text = values.joined(separator: "\n"); localError = nil }
-                                .labelStyle(.titleAndIcon).tint(slipstreamTint).buttonBorderShape(.capsule)
+                                .labelStyle(.titleAndIcon).tint(slipstreamTint).foregroundColor(slipstreamOnTint).buttonBorderShape(.capsule)
                         } else {
                             Button { if let value = UIPasteboard.general.string { text = value; localError = nil } } label: {
                                 Label("Paste", systemImage: "doc.on.clipboard")
@@ -620,7 +703,7 @@ struct ImportView: View {
                         Spacer(minLength: 0)
                     }.padding(.vertical, 6)
                 } header: { Text("Proxies") } footer: {
-                    Text("One per line, as ip:port:user:pass or ip:port.")
+                    Text("One per line, as ip:port:user:pass or ip:port")
                 }
             }
             .navigationTitle("Import Proxies").navigationBarTitleDisplayMode(.inline)
@@ -630,7 +713,7 @@ struct ImportView: View {
                     Button(model.busy ? "Importing…" : "Import") {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         Task {
-                            if await model.perform(["action": "import", "name": name, "type": type, "text": text], label: "Importing proxies…") { text = ""; presentation.wrappedValue.dismiss() }
+                            if await model.perform(.importList(name: name, type: type, text: text)) { text = ""; presentation.wrappedValue.dismiss() }
                             else { localError = model.error }
                         }
                     }.font(Font.body.weight(.semibold)).disabled(model.busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.trimmingCharacters(in: .whitespaces).isEmpty)
@@ -639,7 +722,7 @@ struct ImportView: View {
             .dismissDisabled(model.busy)
             .onAppear { name = suggestedName
                 #if targetEnvironment(simulator)
-                if ProcessInfo.processInfo.environment["SLIPSTREAM_PREVIEW_SHEET"] == "import-socks5" { type = "socks5" }
+                if ProcessInfo.processInfo.environment["SLIPSTREAM_PREVIEW_SHEET"] == "import-socks5" { type = .socks5 }
                 #endif
             }
             .fileImporter(isPresented: $filePicker, allowedContentTypes: [.plainText, .text]) { result in
@@ -667,7 +750,7 @@ struct ListsView: View {
     @State private var deleting: SavedList?
     var body: some View {
         List {
-            if let error = model.error { Section { Label { Text(error).font(.subheadline) } icon: { WarningSymbol() } } }
+            if let error = model.error { Section { ErrorLabel(message: error) } }
             if model.snapshot?.lists.isEmpty == true { Text("No lists").foregroundColor(.secondary) }
             ForEach(model.snapshot?.lists ?? []) { group in
                 HStack {
@@ -685,10 +768,10 @@ struct ListsView: View {
             }
         }.listStyle(.insetGrouped).navigationTitle("Manage Lists").navigationBarTitleDisplayMode(.inline)
         .textPrompt("Rename List", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }), text: $newName, placeholder: "List name") {
-            if let group = renaming { Task { await model.perform(["action": "rename_list", "id": group.id, "name": newName], label: "Renaming list…") } }; renaming = nil
+            if let group = renaming { Task { await model.perform(.renameList(id: group.id, name: newName)) } }; renaming = nil
         }
         .confirmation("Delete this list?", item: $deleting, label: { "Delete \($0.name)" }) { group in
-            Task { await model.perform(["action": "delete_list", "id": group.id], label: "Deleting list…") }
+            Task { await model.perform(.deleteList(id: group.id)) }
         }
     }
 }
@@ -704,10 +787,10 @@ struct AppsView: View {
     @State private var failed = false
     var visible: [InstalledApp] { apps.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.id.localizedCaseInsensitiveContains(search) } }
     var missing: [String] { routing.bundle_ids.filter { id in !apps.contains { $0.id == id } } }
-    var unsupported: Bool { apps.contains { $0.requires_all && routing.bundle_ids.contains($0.id) } }
+    var unsupported: Bool { apps.contains { $0.requires_domains && routing.bundle_ids.contains($0.id) } }
     var body: some View {
         Group {
-            if routing.mode == "selected" { content.searchDrawer($search, prompt: "Search apps") }
+            if routing.mode == .selected { content.searchDrawer($search, prompt: "Search apps") }
             else { content }
         }
         .navigationTitle("Apps").navigationBarTitleDisplayMode(.inline)
@@ -715,14 +798,13 @@ struct AppsView: View {
             ToolbarItem(placement: .confirmationAction) {
                 Button(model.operation == nil ? "Save" : "Saving…") {
                     Task {
-                        let value: [String: Any] = ["mode": routing.mode, "bundle_ids": routing.bundle_ids.sorted()]
-                        if await model.perform(["action": "set_app_routing", "routing": value], label: "Saving…") { presentation.wrappedValue.dismiss() }
+                        if await model.perform(.setAppRouting(routing)) { presentation.wrappedValue.dismiss() }
                     }
-                }.disabled(model.busy || routing == original || (routing.mode == "selected" && (routing.bundle_ids.isEmpty || loading || failed || !missing.isEmpty || unsupported)))
+                }.disabled(model.busy || routing == original || (routing.mode == .selected && (routing.bundle_ids.isEmpty || loading || failed || !missing.isEmpty || unsupported)))
             }
         }
         .backportedTask {
-            original = model.snapshot?.appRouting ?? AppRouting()
+            original = model.snapshot?.app_routing ?? AppRouting()
             routing = original
             await load()
         }
@@ -731,12 +813,12 @@ struct AppsView: View {
         List {
             Section {
                 Picker("Route", selection: $routing.mode) {
-                    Text("All apps").tag("all")
-                    Text("Selected apps").tag("selected")
+                    Text("All apps").tag(RoutingMode.all)
+                    Text("Selected apps").tag(RoutingMode.selected)
                 }.pickerStyle(.segmented).disabled(model.busy).accessibilityIdentifier("routingMode")
             }
-            if let error = model.error { Section { Label { Text(error).font(.subheadline) } icon: { WarningSymbol() } } }
-            if routing.mode == "selected" {
+            if let error = model.error { Section { ErrorLabel(message: error) } }
+            if routing.mode == .selected {
                 if loading { Section { ProgressView("Loading apps…") } }
                 else if failed {
                     Section { Text("Could not load apps."); Button("Retry") { Task { await load() } } }
@@ -745,7 +827,7 @@ struct AppsView: View {
                     Section {
                         if visible.isEmpty { Text("No matches").foregroundColor(.secondary) }
                         ForEach(visible) { app in
-                            selectionRow(name: app.name, id: app.id, requiresAll: app.requires_all)
+                            selectionRow(name: app.name, id: app.id, unprotectable: app.requires_domains)
                         }
                     } header: { Text("\(routing.bundle_ids.count) selected") }
                       footer: { Text("Only apps you installed are listed. Other apps, including Apple’s, use your normal IP.") }
@@ -756,24 +838,22 @@ struct AppsView: View {
             }
         }.listStyle(.insetGrouped)
     }
-    private func selectionRow(name: String, id: String, requiresAll: Bool = false) -> some View {
+    private func selectionRow(name: String, id: String, unprotectable: Bool = false) -> some View {
         let selected = routing.bundle_ids.contains(id)
         return Button {
             if selected { routing.bundle_ids.removeAll { $0 == id } }
             else { routing.bundle_ids.append(id); routing.bundle_ids.sort() }
         } label: {
             HStack(spacing: 12) {
-                // Dimmed with the name when the app cannot be selected.
-                AppIcon(id: id).opacity(requiresAll && !selected ? 0.4 : 1)
+                AppIcon(id: id).opacity(unprotectable && !selected ? 0.4 : 1)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(name).foregroundColor(.primary).fixedSize(horizontal: false, vertical: true)
-                    if requiresAll { Text("Not supported").font(.caption).foregroundColor(.secondary) }
+                    if unprotectable { Text("Not supported").font(.caption).foregroundColor(.secondary) }
                 }
                 Spacer(minLength: 8)
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                    .font(.title3).foregroundColor(selected ? slipstreamTint : Color(.tertiaryLabel))
+                SelectionMark(selected: selected)
             }.frame(minHeight: 44).contentShape(Rectangle())
-        }.buttonStyle(.plain).disabled(model.busy || (requiresAll && !selected))
+        }.buttonStyle(.plain).disabled(model.busy || (unprotectable && !selected))
          .accessibilityAddTraits(selected ? .isSelected : [])
     }
     private func load() async {
@@ -839,6 +919,19 @@ struct DetailRow<Value: View>: View {
 
 struct WarningSymbol: View {
     var body: some View { Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange) }
+}
+
+struct ErrorLabel: View {
+    let message: String
+    var body: some View { Label { Text(message).font(.subheadline) } icon: { WarningSymbol() } }
+}
+
+struct SelectionMark: View {
+    let selected: Bool
+    var body: some View {
+        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+            .font(.title3).foregroundColor(selected ? slipstreamTint : Color(.tertiaryLabel))
+    }
 }
 
 // MARK: iOS 14 compatibility. Later versions keep their native presentation.
@@ -946,12 +1039,12 @@ extension View {
     /// Paired capsule buttons that share a row; iOS 14 has no bordered styles.
     @ViewBuilder func capsule(prominent: Bool = false) -> some View {
         if #available(iOS 15, *) {
-            if prominent { buttonStyle(.borderedProminent).buttonBorderShape(.capsule) }
+            if prominent { buttonStyle(.borderedProminent).buttonBorderShape(.capsule).foregroundColor(slipstreamOnTint) }
             else { buttonStyle(.bordered).buttonBorderShape(.capsule) }
         } else { buttonStyle(.borderless) }
     }
     @ViewBuilder func prominent() -> some View {
-        if #available(iOS 15, *) { buttonStyle(.borderedProminent).controlSize(.large) } else { self }
+        if #available(iOS 15, *) { buttonStyle(.borderedProminent).controlSize(.large).foregroundColor(slipstreamOnTint) } else { self }
     }
     @ViewBuilder func dismissDisabled(_ disabled: Bool) -> some View {
         if #available(iOS 15, *) { interactiveDismissDisabled(disabled) } else { self }

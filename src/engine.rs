@@ -24,6 +24,7 @@ use tun2proxy::{ArgProxy, ProxyConnector, ProxyType, socks5_proto::Address};
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Resolver for DNS addressed to a local or private server, which the proxy cannot reach.
 const DNS_SERVER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+const DNS_PORT: u16 = 53;
 /// Concurrent DNS exchanges per UDP flow; further queries are dropped and retried by the client.
 const DNS_PER_FLOW: usize = 16;
 /// A UDP frame: a SOCKS5 address of at most 259 bytes followed by the datagram.
@@ -32,9 +33,14 @@ const MAX_FRAME: usize = 259 + 65535;
 /// The current proxy. Replacing it ends every session opened through the previous one.
 #[derive(Clone)]
 struct Upstream {
+    proxy: Arc<ArgProxy>,
     connector: Arc<ProxyConnector>,
-    socks: bool,
     stop: CancellationToken,
+}
+impl Upstream {
+    fn socks(&self) -> bool {
+        self.proxy.proxy_type == ProxyType::Socks5
+    }
 }
 struct Engine {
     runtime: tokio::runtime::Runtime,
@@ -50,32 +56,25 @@ fn engine_runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-fn supported(proxy: &ArgProxy) -> bool {
-    matches!(proxy.proxy_type, ProxyType::Http | ProxyType::Socks5)
-}
-
-unsafe fn parse_proxy(proxy: *const c_char) -> Option<ArgProxy> {
-    if proxy.is_null() {
-        return None;
-    }
-    let url = unsafe { CStr::from_ptr(proxy) }.to_str().ok()?;
-    ArgProxy::try_from(url).ok().filter(supported)
-}
-
 /// Starts the engine, or switches a running engine to `proxy` and ends the previous proxy's
 /// sessions. 0 on success, 1 for an unsupported proxy, 2 when the runtime cannot start.
+///
+/// # Safety
 /// `proxy` must be a NUL-terminated string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn proxy_engine_start(proxy: *const c_char) -> i32 {
-    let Some(proxy) = (unsafe { parse_proxy(proxy) }) else {
+    let url = (!proxy.is_null())
+        .then(|| unsafe { CStr::from_ptr(proxy) }.to_str().ok())
+        .flatten();
+    let Some(proxy) = url.and_then(|url| ArgProxy::try_from(url).ok()) else {
         return 1;
     };
     let Ok(connector) = ProxyConnector::new(&proxy) else {
         return 1;
     };
     let upstream = Upstream {
+        proxy: Arc::new(proxy),
         connector: Arc::new(connector),
-        socks: proxy.proxy_type == ProxyType::Socks5,
         stop: CancellationToken::new(),
     };
     let mut engine = ENGINE.lock().unwrap();
@@ -107,16 +106,19 @@ pub extern "C" fn proxy_engine_set_interface(interface: u32) {
     INTERFACE.store(interface, Ordering::Release);
 }
 
-/// Runs a session with the current proxy until it ends or the proxy changes.
+/// Runs a session with the current proxy until it ends or the proxy changes. `session` returns
+/// None to refuse the flow.
 fn spawn<F: Future<Output = io::Result<()>> + Send + 'static>(
-    session: impl FnOnce(Upstream) -> F,
+    session: impl FnOnce(Upstream) -> Option<F>,
 ) -> bool {
     let engine = ENGINE.lock().unwrap();
     let Some(engine) = engine.as_ref() else {
         return false;
     };
     let stop = engine.upstream.stop.clone();
-    let session = session(engine.upstream.clone());
+    let Some(session) = session(engine.upstream.clone()) else {
+        return false;
+    };
     engine.runtime.spawn(async move {
         tokio::select! {
             _ = stop.cancelled() => {}
@@ -152,11 +154,8 @@ impl Target {
 }
 
 /// Upstream sockets leave through the physical interface the provider reports, never through
-/// another VPN's tunnel. Host tests connect unbound.
+/// another VPN's tunnel.
 fn bind_egress<S: std::os::fd::AsFd>(socket: &S, ipv4: bool) -> io::Result<()> {
-    if cfg!(not(target_os = "ios")) {
-        return Ok(());
-    }
     let index = std::num::NonZeroU32::new(INTERFACE.load(Ordering::Acquire))
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no physical interface"))?;
     let socket = socket2::SockRef::from(socket);
@@ -200,7 +199,10 @@ async fn open(
 
 /// Relays one TCP flow to `host`, an IP address or domain name, at `port`. Owns `fd`, a stream
 /// socket that first receives one status byte: 0 once the proxy has connected, otherwise 1.
-/// `host` must be a NUL-terminated string. Returns 0 when the session started.
+/// Returns 0 when the session started.
+///
+/// # Safety
+/// `host` must be a NUL-terminated string, and the engine takes ownership of `fd`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn proxy_engine_tcp(fd: i32, host: *const c_char, port: u16) -> i32 {
     let flow = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
@@ -208,8 +210,8 @@ pub unsafe extern "C" fn proxy_engine_tcp(fd: i32, host: *const c_char, port: u1
         .then(|| unsafe { CStr::from_ptr(host) }.to_str().ok())
         .flatten()
         .and_then(|host| Target::new(host, port));
-    let started =
-        target.is_some_and(|target| spawn(move |upstream| tcp_session(flow, target, upstream)));
+    let started = target
+        .is_some_and(|target| spawn(move |upstream| Some(tcp_session(flow, target, upstream))));
     if started { 0 } else { 1 }
 }
 
@@ -232,18 +234,22 @@ async fn tcp_session(
     Ok(())
 }
 
-/// Relays one UDP flow. Owns `fd`, a datagram socket whose frames carry a SOCKS5 address, the
-/// remote endpoint, followed by the payload in both directions. DNS goes over TCP through the
-/// proxy. Other datagrams use one UDP ASSOCIATE per flow with a SOCKS5 proxy and are dropped
-/// with an HTTP proxy. Returns 0 when the session started.
+/// Relays one UDP flow whose first datagram goes to `port`. Owns `fd`, a datagram socket whose
+/// frames carry a SOCKS5 address, the remote endpoint, followed by the payload in both
+/// directions. DNS goes over TCP through the proxy. Other datagrams use one UDP ASSOCIATE per
+/// flow with a SOCKS5 proxy; HTTP CONNECT carries none, so an HTTP proxy refuses such a flow at
+/// once, letting QUIC fall back to TCP, and drops such datagrams. Returns 0 when the session
+/// started.
+///
+/// # Safety
+/// The engine takes ownership of `fd`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn proxy_engine_udp(fd: i32) -> i32 {
+pub unsafe extern "C" fn proxy_engine_udp(fd: i32, port: u16) -> i32 {
     let flow = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd) };
-    if spawn(move |upstream| udp_session(flow, upstream)) {
-        0
-    } else {
-        1
-    }
+    let started = spawn(move |upstream| {
+        (port == DNS_PORT || upstream.socks()).then(|| udp_session(flow, upstream))
+    });
+    if started { 0 } else { 1 }
 }
 
 /// A SOCKS5 UDP ASSOCIATE. The proxy keeps the relay while the control connection stays open.
@@ -297,14 +303,14 @@ async fn udp_session(flow: std::os::unix::net::UnixDatagram, upstream: Upstream)
                     Address::Socket(address) => address.port(),
                     Address::Domain(_, port) => *port,
                 };
-                if port == 53 {
+                if port == DNS_PORT {
                     if dns.len() < DNS_PER_FLOW {
                         let query = frame[used..].to_vec();
                         dns.spawn(dns_exchange(upstream.clone(), flow.clone(), address, query));
                     }
                     continue;
                 }
-                if !upstream.socks {
+                if !upstream.socks() {
                     continue;
                 }
                 if relay.is_none() {
@@ -404,53 +410,34 @@ async fn dns_exchange(
     Ok(())
 }
 
-/// The proxy plus the physical interface name a probe must bind to.
-unsafe fn probe_target(
-    proxy: *const c_char,
-    interface: u32,
-) -> Option<(ArgProxy, std::net::SocketAddrV4, String)> {
-    if interface == 0 {
-        return None;
-    }
-    let proxy = unsafe { parse_proxy(proxy) }?;
-    let SocketAddr::V4(address) = proxy.addr else {
-        return None;
-    };
-    let mut name = [0; libc::IFNAMSIZ];
-    if unsafe { libc::if_indextoname(interface, name.as_mut_ptr()) }.is_null() {
-        return None;
-    }
-    let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_str().ok()?;
-    Some((proxy, address, name.to_owned()))
-}
-
-/// Milliseconds for a fresh TCP handshake with the proxy, or -1.
+/// Runs the connection check through the current proxy and interface and writes it as JSON into
+/// `out`. Returns the length written, or 0 when the proxy did not answer.
+///
+/// # Safety
+/// `out` must point to `capacity` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn proxy_engine_latency(proxy: *const c_char, interface: u32) -> i64 {
-    let Some((_, address, name)) = (unsafe { probe_target(proxy, interface) }) else {
-        return -1;
+pub unsafe extern "C" fn proxy_engine_check(out: *mut u8, capacity: usize) -> usize {
+    let Some(proxy) = ENGINE.lock().unwrap().as_ref().map(|e| e.upstream.proxy.clone()) else {
+        return 0;
     };
-    crate::latency::measure(address, &name)
-        .map(|ms| ms as i64)
-        .unwrap_or(-1)
-}
-
-/// UDP relay availability: 1 relayed, 0 refused by the SOCKS5 proxy, 2 blocked (HTTP), -1 unknown.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn proxy_engine_udp_relay(proxy: *const c_char, interface: u32) -> i32 {
-    let Some((proxy, address, name)) = (unsafe { probe_target(proxy, interface) }) else {
-        return -1;
+    let socket = || {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )?;
+        bind_egress(&socket, true)?;
+        Ok(socket)
     };
-    if proxy.proxy_type == ProxyType::Http {
-        return 2;
-    }
-    let credentials = proxy
-        .credentials
-        .as_ref()
-        .map(|key| (key.username.as_str(), key.password.as_str()));
-    crate::latency::udp_relay(address, &name, credentials)
-        .map(i32::from)
-        .unwrap_or(-1)
+    let Some(json) = crate::check::run(&proxy, socket)
+        .ok()
+        .and_then(|check| serde_json::to_vec(&check).ok())
+        .filter(|json| json.len() <= capacity && !out.is_null())
+    else {
+        return 0;
+    };
+    unsafe { std::ptr::copy_nonoverlapping(json.as_ptr(), out, json.len()) };
+    json.len()
 }
 
 #[cfg(test)]
@@ -467,7 +454,10 @@ mod tests {
     /// The engine is process-global, so tests using it must not overlap.
     static SERIAL: Mutex<()> = Mutex::new(());
 
+    /// Starts the engine with `proxy`, its upstream sockets bound to the loopback interface.
     fn start(proxy: &str) {
+        let loopback = std::ffi::CString::new("lo0").unwrap();
+        proxy_engine_set_interface(unsafe { libc::if_nametoindex(loopback.as_ptr()) });
         let proxy = std::ffi::CString::new(proxy).unwrap();
         assert_eq!(unsafe { proxy_engine_start(proxy.as_ptr()) }, 0);
     }
@@ -483,10 +473,10 @@ mod tests {
         flow
     }
 
-    fn udp_flow() -> net::UnixDatagram {
+    fn udp_flow(port: u16) -> net::UnixDatagram {
         let (flow, engine) = net::UnixDatagram::pair().unwrap();
         flow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        assert_eq!(unsafe { proxy_engine_udp(engine.into_raw_fd()) }, 0);
+        assert_eq!(unsafe { proxy_engine_udp(engine.into_raw_fd(), port) }, 0);
         flow
     }
 
@@ -645,7 +635,7 @@ mod tests {
         let (requests, received) = mpsc::channel();
         let proxy = socks5_proxy(0, relay.local_addr().unwrap(), requests);
         start(&format!("socks5://user:p%3Ass@{proxy}"));
-        let flow = udp_flow();
+        let flow = udp_flow(443);
         let quic: SocketAddr = "1.1.1.1:443".parse().unwrap();
         flow.send(&frame(quic, b"quic?")).unwrap();
         let mut datagram = [0u8; 1500];
@@ -687,44 +677,32 @@ mod tests {
     }
 
     #[test]
-    fn dns_goes_over_tcp_through_the_proxy_and_answers_from_the_queried_server() {
+    fn dns_goes_over_tcp_through_the_proxy_to_resolvers_it_can_reach() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        // The proxy answers the DNS exchange itself: a two-byte length and the message.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy = listener.local_addr().unwrap();
         let (requests, received) = mpsc::channel();
-        thread::spawn(move || {
-            let (mut client, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(client.try_clone().unwrap());
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            while {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                header != "\r\n"
-            } {}
-            client
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .unwrap();
-            let mut length = [0u8; 2];
-            reader.read_exact(&mut length).unwrap();
-            let mut query = vec![0u8; u16::from_be_bytes(length).into()];
-            reader.read_exact(&mut query).unwrap();
-            requests.send((line.trim().to_owned(), query)).unwrap();
-            client.write_all(&[0, 6]).unwrap();
-            client.write_all(b"answer").unwrap();
-        });
-        start(&format!("http://{proxy}"));
-        let flow = udp_flow();
-        // A LAN resolver is unreachable from the proxy, so the query goes to the fallback.
-        let router: SocketAddr = "192.168.1.1:53".parse().unwrap();
-        flow.send(&frame(router, b"query")).unwrap();
-        let mut datagram = [0u8; 512];
-        let n = flow.recv(&mut datagram).unwrap();
-        assert_eq!(&datagram[..n], &frame(router, b"answer")[..]);
-        let (line, query) = received.recv().unwrap();
-        assert_eq!(line, "CONNECT 8.8.8.8:53 HTTP/1.1");
-        assert_eq!(query, b"query");
+        start(&format!("http://{}", http_proxy(200, requests)));
+        // A resolver the proxy cannot reach, such as one on the LAN, is replaced by 8.8.8.8.
+        for (resolver, asked) in [
+            ("8.8.8.8:53", "8.8.8.8:53"),
+            ("[2001:4860:4860::8888]:53", "[2001:4860:4860::8888]:53"),
+            ("192.168.86.1:53", "8.8.8.8:53"),
+            ("10.0.0.1:53", "8.8.8.8:53"),
+            ("100.100.100.100:53", "8.8.8.8:53"),
+            ("127.0.0.1:53", "8.8.8.8:53"),
+            ("[fe80::1]:53", "8.8.8.8:53"),
+            ("[fd7a:115c:a1e0::53]:53", "8.8.8.8:53"),
+            ("[::ffff:192.168.1.1]:53", "8.8.8.8:53"),
+        ] {
+            let resolver: SocketAddr = resolver.parse().unwrap();
+            let flow = udp_flow(53);
+            flow.send(&frame(resolver, b"query")).unwrap();
+            let mut datagram = [0u8; 512];
+            let n = flow.recv(&mut datagram).unwrap();
+            // The proxy echoes, so the answer is the query, returned as if from the resolver.
+            assert_eq!(&datagram[..n], &frame(resolver, b"query")[..], "{resolver}");
+            let (line, _) = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(line, format!("CONNECT {asked} HTTP/1.1"), "{resolver}");
+        }
         proxy_engine_stop();
     }
 
@@ -742,24 +720,31 @@ mod tests {
                 1
             );
         }
+        // HTTP CONNECT carries no datagrams, so QUIC is refused and falls back to TCP.
+        let (_flow, engine) = net::UnixDatagram::pair().unwrap();
+        assert_eq!(unsafe { proxy_engine_udp(engine.into_raw_fd(), 443) }, 1);
         proxy_engine_stop();
     }
 
     #[test]
-    fn only_public_resolvers_are_asked_through_the_proxy() {
-        for ip in ["8.8.8.8", "2001:4860:4860::8888"] {
-            assert!(public(ip.parse().unwrap()), "{ip}");
-        }
-        for ip in [
-            "192.168.86.1",
-            "10.0.0.1",
-            "100.100.100.100",
-            "127.0.0.1",
-            "fe80::1",
-            "fd7a:115c:a1e0::53",
-            "::ffff:192.168.1.1",
-        ] {
-            assert!(!public(ip.parse().unwrap()), "{ip}");
-        }
+    fn the_connection_check_measures_the_current_proxy_over_the_physical_interface() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = listener.local_addr().unwrap();
+        thread::spawn(move || listener.incoming().for_each(drop));
+        start(&format!("http://{proxy}"));
+        let check = || {
+            let mut out = [0u8; 128];
+            let n = unsafe { proxy_engine_check(out.as_mut_ptr(), out.len()) };
+            (n > 0).then(|| serde_json::from_slice::<crate::check::Check>(&out[..n]).unwrap())
+        };
+        let result = check().unwrap();
+        assert!(result.latency_ms >= 1);
+        assert_eq!(result.udp, Some(crate::check::UdpRelay::Blocked));
+        // Without a physical interface, nothing connects.
+        proxy_engine_set_interface(0);
+        assert_eq!(check(), None);
+        proxy_engine_stop();
+        assert_eq!(check(), None);
     }
 }

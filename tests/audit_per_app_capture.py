@@ -8,10 +8,9 @@ import struct
 import uuid
 
 
-def audit(path, selected, names, tunnel=(), provider=(), proxy=()):
-    """With an app proxy there is no tunnel: selected apps' flows are diverted before any packet
-    exists, so every selected packet is direct, and the provider may only reach the proxy."""
-    tunnels = {tunnel} if isinstance(tunnel, str) else set(tunnel)
+def audit(path, selected, names, provider, proxy):
+    """Selected apps' flows are diverted to the app proxy before any packet exists, so every
+    selected packet went direct, and the provider may only reach the proxy."""
     providers = set(provider)
     # A proxy switch may legitimately use the previous or the new endpoint.
     proxies = {(host, int(port)) for host, port in (p.rsplit(':', 1) for p in ([proxy] if isinstance(proxy, str) else proxy))}
@@ -35,20 +34,12 @@ def audit(path, selected, names, tunnel=(), provider=(), proxy=()):
             counts['packets'] += 1
             if not flags & 2:
                 continue
-            interface = packet[12:36].split(b'\0')[0].decode()
             process = packet[56:73].split(b'\0')[0].decode(errors='replace')
             effective = packet[88:105].split(b'\0')[0].decode(errors='replace')
             ids = {str(uuid.UUID(bytes=packet[124:140])), str(uuid.UUID(bytes=packet[140:156]))}
             prefix = struct.unpack_from('<I', packet, 44)[0]
             ip = packet[length + prefix:]
-            source = None
-            if len(ip) >= 20 and ip[0] >> 4 == 4:
-                source = str(ipaddress.ip_address(ip[12:16]))
-            elif len(ip) >= 40 and ip[0] >> 4 == 6:
-                source = str(ipaddress.ip_address(ip[8:24]))
-            if source in ('198.18.0.1', 'fd00:51:1::1') and interface not in tunnels:
-                counts['tunnel_source_outside_tunnel'] += 1
-            if providers and {process, effective} & providers:
+            if {process, effective} & providers:
                 destination, proto, port = endpoint(ip)
                 # A SOCKS5 UDP relay port is chosen per association; only its host is fixed.
                 if (destination, port) in proxies and proto == 6 or proto == 17 and destination in {host for host, _ in proxies}:
@@ -68,16 +59,8 @@ def audit(path, selected, names, tunnel=(), provider=(), proxy=()):
             if port == 53:
                 counts['selected_dns'] += 1
             destinations.add(address)
-            if interface in tunnels:
-                counts['selected_tunnel'] += 1
-            else:
-                counts['selected_outside_tunnel'] += 1
-    if providers:
-        passed = counts['provider_to_proxy'] > 0 and counts['provider_elsewhere'] == 0 and counts['selected_outbound'] == 0
-    else:
-        passed = counts['selected_outbound'] > 0 and counts['selected_outside_tunnel'] == 0
-    return {'counts': dict(counts), 'selected_destination_count': len(destinations),
-            'passed': passed and counts['tunnel_source_outside_tunnel'] == 0}
+    passed = counts['provider_to_proxy'] > 0 and counts['provider_elsewhere'] == 0 and counts['selected_outbound'] == 0
+    return {'counts': dict(counts), 'selected_destination_count': len(destinations), 'passed': passed}
 
 
 def endpoint(ip):
@@ -97,12 +80,11 @@ if __name__ == '__main__':
     parser.add_argument('capture')
     parser.add_argument('--uuid', action='append', default=[])
     parser.add_argument('--process', action='append', default=[])
-    parser.add_argument('--tunnel', action='append', default=[], help='packet tunnel interface')
-    parser.add_argument('--provider', action='append', default=[], help='app proxy provider process name')
-    parser.add_argument('--proxy', action='append', default=[], help='IP:PORT of an upstream proxy, with --provider')
+    parser.add_argument('--provider', action='append', required=True, help='app proxy provider process name')
+    parser.add_argument('--proxy', action='append', required=True, help='IP:PORT of an upstream proxy')
     args = parser.parse_args()
-    if bool(args.tunnel) == bool(args.provider) or bool(args.provider) != bool(args.proxy):
-        parser.error('use --tunnel for a packet tunnel, or --provider with --proxy for an app proxy')
-    result = audit(args.capture, {str(uuid.UUID(s)) for s in args.uuid}, set(args.process), args.tunnel, args.provider, args.proxy)
+    if not args.uuid and not args.process:
+        parser.error('name the selected app with --process or --uuid')
+    result = audit(args.capture, {str(uuid.UUID(s)) for s in args.uuid}, set(args.process), args.provider, args.proxy)
     print(json.dumps(result, indent=2))
     raise SystemExit(0 if result['passed'] else 1)

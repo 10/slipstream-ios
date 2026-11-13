@@ -62,7 +62,7 @@ def package(ver):
     source = ROOT / 'build/install'
     if plistlib.loads((source / 'Slipstream.app/Info.plist').read_bytes())['CFBundleShortVersionString'] != ver:
         raise ValueError('Rebuild with SLIPSTREAM_VERSION matching the package version')
-    # build.sh writes the scheme's prefix into every script; the shebang identifies the build.
+    # build.sh writes the scheme's prefix into slipstreamctl, so its shebang identifies the build.
     prefix = '/var/jb' if (source / 'slipstreamctl').read_text().startswith('#!/var/jb/') else ''
     arch = ARCHES[prefix]
     stage = ROOT / 'build/deb-stage'
@@ -112,10 +112,7 @@ Description: Per-app HTTP CONNECT / SOCKS5 proxy tunnel
     subprocess.run(['dpkg-deb', '--root-owner-group', '-Zxz', '--build', str(stage), str(output)], check=True)
     return output
 
-def repository(url, output, debs, signing_key):
-    if not url.startswith('https://') or any(c.isspace() for c in url):
-        raise ValueError('Repository URL must use HTTPS without whitespace')
-    url = url.rstrip('/') + '/'
+def repository(output, debs, signing_key):
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError('Repository output directory must be empty')
@@ -156,11 +153,11 @@ def repository(url, output, debs, signing_key):
     shutil.copy2(ROOT / 'docs/images/icon.png', output / 'CydiaIcon.png')
     keyprint = run('gpg', '--show-keys', '--with-colons', str(output/'repository-key.gpg'))
     fingerprint = next(line.split(':')[9] for line in keyprint.splitlines() if line.startswith('fpr:'))
-    safe_url = html.escape(url, quote=True)
+    safe_url = html.escape(REPO, quote=True)
     labels = {'iphoneos-arm64': 'Rootless, such as Dopamine or palera1n', 'iphoneos-arm': 'Rootful, such as Taurine'}
     downloads = ''.join(f'<li><a href="pool/{latest[arch][2]}">{labels[arch]}</a></li>' for arch in sorted(latest))
     (output/'index.html').write_text(f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slipstream</title>
-<style>:root{{color-scheme:light dark}}body{{font:17px/1.6 system-ui;max-width:42rem;margin:4rem auto;padding:0 1.5rem}}a{{color:light-dark(#006c70,#58d6d0)}}code{{overflow-wrap:anywhere}}img{{border-radius:22%}}small{{display:block;margin-top:3rem}}</style>
+<style>:root{{color-scheme:light dark}}body{{font:17px/1.6 system-ui;max-width:42rem;margin:4rem auto;padding:0 1.5rem}}a{{color:light-dark(#0065f0,#4d97ff)}}code{{overflow-wrap:anywhere}}img{{border-radius:22%}}small{{display:block;margin-top:3rem}}</style>
 <main><img src="CydiaIcon.png" width="96" height="96" alt=""><h1>Slipstream</h1><p>Send a jailbroken iPhone’s app traffic through your HTTP CONNECT or SOCKS5 proxy, for every app you installed or only the ones you choose.</p>
 <p><a href="sileo://source/{safe_url}">Add to Sileo</a></p><p>Or add <code>{safe_url}</code> in Sileo → Sources → +.</p>
 <p>Version {ver} · iOS 14+ · Rootless and rootful jailbreaks</p>
@@ -174,7 +171,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('package'); p.add_argument('version')
-    p = sub.add_parser('repository'); p.add_argument('url'); p.add_argument('output'); p.add_argument('debs', nargs='+'); p.add_argument('--signing-key', required=True)
+    p = sub.add_parser('repository'); p.add_argument('output'); p.add_argument('debs', nargs='+'); p.add_argument('--signing-key', required=True)
     args = parser.parse_args()
     if args.command == 'package': print(package(args.version))
-    else: repository(args.url, args.output, args.debs, args.signing_key)
+    else: repository(args.output, args.debs, args.signing_key)

@@ -19,4 +19,5 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=NetworkExtension");
     println!("cargo:rerun-if-changed=src/app_catalog.m");
     println!("cargo:rerun-if-changed=src/tunnel.m");
+    println!("cargo:rerun-if-changed=provider/ProviderInterface.h");
 }

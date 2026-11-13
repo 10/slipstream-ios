@@ -16,8 +16,8 @@ static void deny(void) {
     puts("{\"ok\":false,\"message\":\"Open Slipstream from the Home Screen to manage protection.\"}");
     exit(1);
 }
-extern int slipstream_provider_latency(void);
 int main(int argc, char **argv) {
+    (void)argv;
     uid_t caller=getuid();
     if (geteuid()!=0) deny();
     if (caller!=0) {
@@ -33,7 +33,6 @@ int main(int argc, char **argv) {
     char *env[]={"PATH=" SLIPSTREAM_PREFIX "/usr/local/bin:" SLIPSTREAM_PREFIX "/usr/bin:" SLIPSTREAM_PREFIX "/bin:/usr/bin:/bin:/usr/sbin:/sbin","HOME=/var/root",NULL};
     environ=env;
     alarm(60);
-    if (argc==2 && !strcmp(argv[1],"--latency")) return slipstream_provider_latency();
     if (argc!=1) deny();
     char *args[]={"slipstream","manage",NULL};
     execve(SLIPSTREAM_PREFIX "/usr/local/bin/slipstream",args,env);

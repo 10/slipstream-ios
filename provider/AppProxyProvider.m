@@ -7,18 +7,20 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#import "ProviderInterface.h"
 
+// src/engine.rs
 extern int proxy_engine_start(const char *);
 extern void proxy_engine_stop(void);
 extern void proxy_engine_set_interface(unsigned);
 extern int proxy_engine_tcp(int, const char *, unsigned short);
-extern int proxy_engine_udp(int);
-extern int64_t proxy_engine_latency(const char *, unsigned);
-extern int proxy_engine_udp_relay(const char *, unsigned);
+extern int proxy_engine_udp(int, unsigned short);
+extern size_t proxy_engine_check(uint8_t *, size_t);
 
-// Further flows are closed rather than queued, like the packet engine's session limit.
+// Further flows are closed rather than queued.
 static const NSUInteger MaxFlows=128;
-// A UDP frame: the remote endpoint as a SOCKS5 address (at most 259 bytes), then the datagram.
+// A UDP frame, as src/engine.rs reads it: the remote endpoint as a SOCKS5 address (at most 259
+// bytes), then the datagram.
 static const size_t MaxFrame=259+65535;
 
 static NSError *posixError(int code) { return [NSError errorWithDomain:NSPOSIXErrorDomain code:code userInfo:nil]; }
@@ -85,6 +87,8 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
 }
 @property (readonly) NEAppProxyFlow *flow;
 @property (copy) void (^done)(void);
++ (int)socketType;
++ (int)bufferSize;
 - (void)start;
 - (void)readable;
 - (void)writable;
@@ -112,6 +116,8 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
     }
     return self;
 }
++ (int)socketType { return SOCK_STREAM; }
++ (int)bufferSize { return 65536; }
 - (void)start {}
 - (void)readable {}
 - (void)writable {}
@@ -224,6 +230,8 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
 @interface UDPRelay : Relay
 @end
 @implementation UDPRelay
++ (int)socketType { return SOCK_DGRAM; }
++ (int)bufferSize { return 262144; }
 - (void)start {
     [self.flow openWithLocalEndpoint:nil completionHandler:^(NSError *error) {
         dispatch_async(self->_queue, ^{
@@ -272,8 +280,6 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
 @end
 
 @interface AppProxyProvider : NEAppProxyProvider
-@property (copy) NSString *proxyURL;
-@property unsigned interfaceIndex;
 @property BOOL stopped;
 @property NSMutableSet<Relay*> *relays;
 @property nw_path_monitor_t monitor;
@@ -294,7 +300,7 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
     Relay *relay;
     @synchronized (self) {
         if (self.stopped || self.relays.count>=MaxFlows) return NO;
-        int engineFD,fd=socketPair(kind==TCPRelay.class?SOCK_STREAM:SOCK_DGRAM,kind==TCPRelay.class?65536:262144,&engineFD);
+        int engineFD,fd=socketPair([kind socketType],[kind bufferSize],&engineFD);
         if (fd<0) return NO;
         // The engine owns its end even when it refuses the flow.
         if (start(engineFD)) { close(fd); return NO; }
@@ -312,7 +318,6 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
     return YES;
 }
 - (BOOL)handleNewFlow:(NEAppProxyFlow*)flow {
-    if ([flow isKindOfClass:NEAppProxyUDPFlow.class]) return [self acceptUDP:(NEAppProxyUDPFlow*)flow];
     if (![flow isKindOfClass:NEAppProxyTCPFlow.class]) return NO;
     NWEndpoint *remote=((NEAppProxyTCPFlow*)flow).remoteEndpoint;
     if (![remote isKindOfClass:NWHostEndpoint.class]) return NO;
@@ -323,20 +328,18 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
         return proxy_engine_tcp(engineFD,host.UTF8String,(unsigned short)port);
     }];
 }
-// HTTP CONNECT cannot carry datagrams, so only DNS, sent over TCP, uses an HTTP proxy.
-- (BOOL)acceptUDP:(NEAppProxyUDPFlow*)flow dns:(BOOL)dns {
-    @synchronized (self) { if (!dns && ![self.proxyURL hasPrefix:@"socks5://"]) return NO; }
-    return [self acceptUDP:flow];
+// The engine decides by the first datagram's port whether the proxy can carry the flow.
+- (BOOL)acceptUDP:(NEAppProxyUDPFlow*)flow port:(int)port {
+    return [self accept:flow relay:UDPRelay.class start:^int(int engineFD) {
+        return proxy_engine_udp(engineFD,(unsigned short)(port>0 && port<=65535 ? port : 0));
+    }];
 }
 - (BOOL)handleNewUDPFlow:(NEAppProxyUDPFlow*)flow initialRemoteEndpoint:(NWEndpoint*)remote {
-    return [self acceptUDP:flow dns:[remote isKindOfClass:NWHostEndpoint.class] && [((NWHostEndpoint*)remote).port isEqualToString:@"53"]];
+    return [self acceptUDP:flow port:[remote isKindOfClass:NWHostEndpoint.class] ? ((NWHostEndpoint*)remote).port.intValue : 0];
 }
 // iOS 18 replaces the method above with this one.
 - (BOOL)handleNewUDPFlow:(NEAppProxyUDPFlow*)flow initialRemoteFlowEndpoint:(nw_endpoint_t)remote API_AVAILABLE(ios(18.0)) {
-    return [self acceptUDP:flow dns:nw_endpoint_get_port(remote)==53];
-}
-- (BOOL)acceptUDP:(NEAppProxyUDPFlow*)flow {
-    return [self accept:flow relay:UDPRelay.class start:^int(int engineFD) { return proxy_engine_udp(engineFD); }];
+    return [self acceptUDP:flow port:nw_endpoint_get_port(remote)];
 }
 // Removes every current flow; the caller aborts them outside the lock.
 - (NSArray<Relay*>*)takeRelays {
@@ -346,14 +349,13 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
 }
 - (void)startProxyWithOptions:(NSDictionary*)options completionHandler:(void(^)(NSError*))completion {
     (void)options;
-    NSDictionary *config=((NETunnelProviderProtocol*)self.protocolConfiguration).providerConfiguration;
-    NSString *proxy=config[@"proxy_url"], *address=config[@"proxy_ip"];
-    if (![proxy isKindOfClass:NSString.class] || ![address isKindOfClass:NSString.class]) { completion(posixError(EINVAL)); return; }
+    NETunnelProviderProtocol *protocol=(NETunnelProviderProtocol*)self.protocolConfiguration;
+    NSString *proxy=protocol.providerConfiguration[SlipstreamProxyURLKey], *address=protocol.serverAddress;
+    if (![proxy isKindOfClass:NSString.class] || !address.length) { completion(posixError(EINVAL)); return; }
     if (proxy_engine_start(proxy.UTF8String)) { completion(posixError(EIO)); return; }
-    @synchronized (self) { self.proxyURL=proxy; self.stopped=NO; }
+    @synchronized (self) { self.stopped=NO; }
     // Upstream sockets bind to the physical underlay, never another VPN's tunnel. Index zero
     // blocks connects until a physical path is available.
-    self.interfaceIndex=0;
     proxy_engine_set_interface(0);
     dispatch_queue_t queue=dispatch_queue_create("local.slipstream.path",DISPATCH_QUEUE_SERIAL);
     __weak AppProxyProvider *weak=self;
@@ -375,15 +377,14 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
             }
             return true;
         });
-        owner.interfaceIndex=index;
         proxy_engine_set_interface(index);
         ready();
     });
     nw_path_monitor_start(self.monitor);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),queue,ready);
 }
-// DNS for the selected apps goes to the proxied resolver, as it did through the packet tunnel.
-// No proxy settings are published and no addresses or routes are claimed.
+// DNS for the selected apps goes to the proxied resolver. No proxy settings are published and
+// no addresses or routes are claimed.
 - (void)applySettings:(NSString*)address completion:(void(^)(NSError*))completion {
     NETunnelNetworkSettings *settings=[[NETunnelNetworkSettings alloc]initWithTunnelRemoteAddress:address];
     settings.DNSSettings=[[NEDNSSettings alloc]initWithServers:@[@"8.8.8.8"]];
@@ -395,29 +396,21 @@ static NSData *decodeFrame(const unsigned char *frame,size_t length,NWHostEndpoi
     NSString *text=[[NSString alloc]initWithData:message encoding:NSUTF8StringEncoding];
     // Switches proxies in place: the session stays up and current flows reconnect through
     // the new proxy.
-    if ([text hasPrefix:@"reload\n"] && text.length>7) {
-        NSString *proxy=[text substringFromIndex:7];
+    if ([text hasPrefix:SlipstreamReload] && text.length>SlipstreamReload.length) {
+        NSString *proxy=[text substringFromIndex:SlipstreamReload.length];
         NSArray<Relay*> *relays=nil;
         @synchronized (self) {
-            if (!self.stopped && !proxy_engine_start(proxy.UTF8String)) { self.proxyURL=proxy; relays=[self takeRelays]; }
+            if (!self.stopped && !proxy_engine_start(proxy.UTF8String)) relays=[self takeRelays];
         }
         for (Relay *relay in relays) [relay abort];
-        completion(relays?[@"reloaded" dataUsingEncoding:NSUTF8StringEncoding]:nil);
+        completion(relays?[SlipstreamReloaded dataUsingEncoding:NSUTF8StringEncoding]:nil);
         return;
     }
-    if (![text isEqualToString:@"latency"]) { completion(nil); return; }
-    NSString *proxy;
-    @synchronized (self) { proxy=self.stopped?nil:self.proxyURL; }
-    unsigned interface=self.interfaceIndex;
-    if (!interface || !proxy) { completion(nil); return; }
+    if (![text isEqualToString:SlipstreamCheck]) { completion(nil); return; }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0), ^{
-        int64_t ms=proxy_engine_latency(proxy.UTF8String,interface);
-        if (ms<=0) { completion(nil); return; }
-        // A second fresh connection asks a SOCKS5 proxy whether it grants UDP ASSOCIATE.
-        int udp=proxy_engine_udp_relay(proxy.UTF8String,interface);
-        const char *word=udp==1?"relayed":udp==0?"unsupported":udp==2?"blocked":NULL;
-        NSString *result=word?[NSString stringWithFormat:@"%lld %s",(long long)ms,word]:[NSString stringWithFormat:@"%lld",(long long)ms];
-        completion([result dataUsingEncoding:NSUTF8StringEncoding]);
+        uint8_t result[256];
+        size_t length=proxy_engine_check(result,sizeof(result));
+        completion(length?[NSData dataWithBytes:result length:length]:nil);
     });
 }
 - (void)stopProxyWithReason:(NEProviderStopReason)reason completionHandler:(void(^)(void))completion {
