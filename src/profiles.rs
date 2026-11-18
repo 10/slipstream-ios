@@ -201,21 +201,16 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         }
         let error = |message: &str| format!("Line {}: {message}", i + 1);
         // Providers also export scheme://ip:port, where the scheme must match the list's type...
-        // A scheme has the URL grammar (RFC 3986 §3.1), so a password containing :// is not one.
-        let scheme_like = |scheme: &str| {
-            scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c))
-        };
+        // Whatever precedes :// without a colon is read as a scheme. A password containing ://
+        // always has a colon before it, in both ip:port:user:pass and user:pass@ip:port.
         let (line, url) = match line.split_once("://") {
-            Some((scheme, rest)) if scheme_like(scheme) => {
+            Some((scheme, rest)) if !scheme.contains(':') => {
                 let scheme = scheme.to_ascii_lowercase();
                 match (scheme.as_str(), kind) {
                     ("http", ProxyKind::Http) | ("socks5" | "socks5h", ProxyKind::Socks5) => {
-                        // The authority ends at the first /, ? or #; only a bare trailing slash
-                        // may follow it.
-                        let end = rest.find(&['/', '?', '#'][..]).unwrap_or(rest.len());
+                        // The authority ends at the first /, \, ? or #, as URL parsers read it;
+                        // only a bare trailing slash may follow it.
+                        let end = rest.find(&['/', '\\', '?', '#'][..]).unwrap_or(rest.len());
                         let (authority, tail) = rest.split_at(end);
                         let host = authority
                             .rsplit_once('@')
@@ -287,6 +282,10 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                 .any(|v| v.chars().any(char::is_control))
             {
                 return Err(error("Credentials contain a control character."));
+            }
+            // HTTP Basic authentication ends the username at its first colon.
+            if kind == ProxyKind::Http && username.contains(':') {
+                return Err(error("An HTTP proxy username can't contain a colon."));
             }
             (username, password)
         } else {
@@ -391,8 +390,11 @@ mod tests {
         let host = parse_list("http://198.51.100.8:8080:x:y@203.0.113.9:3128", ProxyKind::Http).unwrap();
         assert_eq!(engine_view(&host[0]), (tun2proxy::ProxyType::Http, "203.0.113.9:3128".into(), "198.51.100.8".into(), "8080:x:y".into()));
         // URL credentials are percent-encoded, and a URL may end with a slash.
-        let url = parse_list("http://us%3Aer:p%40ss%25@203.0.113.6:80/", ProxyKind::Http).unwrap();
-        assert_eq!(engine_view(&url[0]), (tun2proxy::ProxyType::Http, "203.0.113.6:80".into(), "us:er".into(), "p@ss%".into()));
+        let url = parse_list("http://us%20er:p%40ss%25@203.0.113.6:80/", ProxyKind::Http).unwrap();
+        assert_eq!(engine_view(&url[0]), (tun2proxy::ProxyType::Http, "203.0.113.6:80".into(), "us er".into(), "p@ss%".into()));
+        assert!(parse_list("http://us%3Aer:p@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("colon"));
+        let socks = parse_list("socks5://us%3Aer:p@203.0.113.6:1080", ProxyKind::Socks5).unwrap();
+        assert_eq!(engine_view(&socks[0]).2, "us:er");
         assert!(parse_list("http://u:p%zz@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("% escape"));
         assert!(parse_list("http://u:p%0A@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("control character"));
         // Outside a URL, :// may sit inside a password.
@@ -413,6 +415,9 @@ mod tests {
             ("http://SECRET:SECRET@203.0.113.4:80?x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
             ("http://SECRET:SECRET@203.0.113.4:80#x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
             ("socks5+tls://SECRET:SECRET@203.0.113.4:443", ProxyKind::Socks5, "http:// or socks5://"),
+            ("http://SECRET:SECRET@203.0.113.4:80\\x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
+            ("\u{200b}socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
+            ("socks5 ://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
             assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
