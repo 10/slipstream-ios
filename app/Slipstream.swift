@@ -182,7 +182,7 @@ actor PhoneService: Service {
 
 #if targetEnvironment(simulator)
 /// Labeled preview data for UI work. `SLIPSTREAM_PREVIEW` picks the starting state: `empty`,
-/// `off`, `protected`, `starting`, `unavailable`, `selected` or `socks5`.
+/// `unselected`, `off`, `protected`, `starting`, `unavailable`, `selected` or `socks5`.
 actor PreviewService: Service {
     private let environment: [String: String]
     private var snapshot: Snapshot
@@ -193,8 +193,9 @@ actor PreviewService: Service {
         let proxies = (0..<6).map { SavedProxy(id: UInt64($0 + 2), host: "198.51.100.\(42 + $0)", port: 3128, username: "example_user", password: "example_pass:\($0)") }
         let socks = [SavedProxy(id: 11, host: "203.0.113.18", port: 1080, username: "example_user", password: "example_pass", type: .socks5), SavedProxy(id: 12, host: "203.0.113.19", port: 1080, username: "", password: "", type: .socks5)]
         let lists = mode == "empty" ? [] : [SavedList(id: 1, name: "Everyday", proxies: proxies), SavedList(id: 10, name: "Travel", proxies: socks)]
-        let state: ProtectionState = mode == "empty" || mode == "off" ? .disabled : mode == "selected" || mode == "socks5" ? .protected : ProtectionState(rawValue: mode) ?? .protected
-        snapshot = Snapshot(state: state, enabled: mode != "empty" && mode != "off", selected: mode == "empty" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists,
+        let off = ["empty", "unselected", "off"].contains(mode)
+        let state: ProtectionState = off ? .disabled : mode == "selected" || mode == "socks5" ? .protected : ProtectionState(rawValue: mode) ?? .protected
+        snapshot = Snapshot(state: state, enabled: !off, selected: mode == "empty" || mode == "unselected" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists,
                             app_routing: mode == "selected" ? AppRouting(mode: .selected, bundle_ids: ["com.burbn.instagram", "com.google.ios.youtube"]) : AppRouting())
     }
     func send(_ request: Request) -> Reply {
@@ -621,8 +622,10 @@ struct HomeView: View {
     }
     private var statusSubtitle: String? {
         if let operation = model.operation { return operation }
-        guard model.snapshot?.enabled == true else { return nil }
-        return model.snapshot?.network
+        guard let snapshot = model.snapshot else { return nil }
+        if snapshot.enabled { return snapshot.network }
+        // The toggle stays off until a proxy is chosen; say how to choose one.
+        return snapshot.proxy == nil && !groups.allSatisfy({ $0.proxies.isEmpty }) ? "Choose a proxy below" : nil
     }
     private var statusSymbol: String {
         switch model.snapshot?.state {
