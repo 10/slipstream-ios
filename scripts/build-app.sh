@@ -29,13 +29,14 @@ if [ "$platform" = iphoneos ]; then
  for key in CFBundleShortVersionString CFBundleVersion; do plutil -replace "$key" -string "$version" "$extension/Info.plist"; done
  cargo build --locked --release --target aarch64-apple-ios --lib
  xcrun --sdk iphoneos clang -target "$target" -isysroot "$sdk" -Os -Wall -Wextra -Werror -fobjc-arc -fblocks \
-  -fapplication-extension -Wl,-e,_NSExtensionMain provider/AppProxyProvider.m target/aarch64-apple-ios/release/libslipstream.a \
+  -fapplication-extension -Wl,-e,_NSExtensionMain -Wl,-dead_strip,-x provider/AppProxyProvider.m target/aarch64-apple-ios/release/libslipstream.a \
   -framework Foundation -framework Network -framework NetworkExtension -framework SystemConfiguration -framework Security -framework CoreFoundation -liconv -lresolv \
   -o "$extension/AppProxyProvider"
  ldid -Ilocal.slipstream.app.proxy -Sprovider/entitlements.plist "$extension/AppProxyProvider"
  # iOS 14 lacks the Swift concurrency runtime. Newer systems load theirs from /usr/lib/swift first.
+ # Xcode's copy carries 7 MB of embedded bitcode, which nothing on the phone reads.
  mkdir -p "$output/Frameworks"
- cp "$(dirname "$(xcrun --find swiftc)")/../lib/swift-5.5/iphoneos/libswift_Concurrency.dylib" "$output/Frameworks/"
+ xcrun bitcode_strip -r "$(dirname "$(xcrun --find swiftc)")/../lib/swift-5.5/iphoneos/libswift_Concurrency.dylib" -o "$output/Frameworks/libswift_Concurrency.dylib"
  ldid -S "$output/Frameworks/libswift_Concurrency.dylib"
  ldid -Ilocal.slipstream.app -Sapp/entitlements.plist "$output/Slipstream"
  ldid -Ilocal.slipstream.app -Spackaging/cli-entitlements.plist "$output/slipstream-helper"
