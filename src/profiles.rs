@@ -263,7 +263,15 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                         && plain(pass)
                         && !schemes.iter().any(|name| user.eq_ignore_ascii_case(name))
                 });
-                if !url && !strict {
+                // Only ASCII whitespace, and a byte-order mark opening the text, may be trimmed
+                // from around these credentials; a non-breaking space might belong to them.
+                let bare = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+                let bare = if i == 0 {
+                    bare.trim_start_matches('\u{feff}')
+                } else {
+                    bare
+                };
+                if !url && (!strict || bare != line) {
                     return Err(error("Write this proxy as ip:port:user:pass."));
                 }
                 reordered = format!("{endpoint}:{credentials}");
@@ -410,6 +418,10 @@ mod tests {
         let socks = parse_list("socks5://u:p@203.0.113.4:1080\nsocks5h://203.0.113.5:1080", ProxyKind::Socks5).unwrap();
         assert_eq!(socks[0].url(), "socks5://u:p@203.0.113.4:1080");
         assert_eq!(socks[1].url(), "socks5://203.0.113.5:1080");
+        // A byte-order mark is trimmed only where it opens the text.
+        assert_eq!(parse_list("\u{feff}user:pass@203.0.113.4:8080", ProxyKind::Http).unwrap()[0].username, "user");
+        let error = parse_list("# pool\n\u{feff}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http).err().unwrap();
+        assert!(error.starts_with("Line 2:") && !error.contains("SECRET"), "{error}");
         // A URL's host follows its last @, even when its username looks like an address.
         let host = parse_list("http://198.51.100.8:8080:x:y@203.0.113.9:3128", ProxyKind::Http).unwrap();
         assert_eq!(engine_view(&host[0]), (tun2proxy::ProxyType::Http, "203.0.113.9:3128".into(), "198.51.100.8".into(), "8080:x:y".into()));
@@ -457,6 +469,7 @@ mod tests {
             ("http_proxy=SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("\u{200b}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("SECRET:SECRET\u{feff}@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("\u{a0}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("http://SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "http://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
