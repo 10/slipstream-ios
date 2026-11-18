@@ -182,7 +182,7 @@ actor PhoneService: Service {
 
 #if targetEnvironment(simulator)
 /// Labeled preview data for UI work. `SLIPSTREAM_PREVIEW` picks the starting state: `empty`,
-/// `off`, `protected`, `starting`, `unavailable`, `selected` or `socks5`.
+/// `unselected`, `off`, `protected`, `starting`, `unavailable`, `selected` or `socks5`.
 actor PreviewService: Service {
     private let environment: [String: String]
     private var snapshot: Snapshot
@@ -193,8 +193,9 @@ actor PreviewService: Service {
         let proxies = (0..<6).map { SavedProxy(id: UInt64($0 + 2), host: "198.51.100.\(42 + $0)", port: 3128, username: "example_user", password: "example_pass:\($0)") }
         let socks = [SavedProxy(id: 11, host: "203.0.113.18", port: 1080, username: "example_user", password: "example_pass", type: .socks5), SavedProxy(id: 12, host: "203.0.113.19", port: 1080, username: "", password: "", type: .socks5)]
         let lists = mode == "empty" ? [] : [SavedList(id: 1, name: "Everyday", proxies: proxies), SavedList(id: 10, name: "Travel", proxies: socks)]
-        let state: ProtectionState = mode == "empty" || mode == "off" ? .disabled : mode == "selected" || mode == "socks5" ? .protected : ProtectionState(rawValue: mode) ?? .protected
-        snapshot = Snapshot(state: state, enabled: mode != "empty" && mode != "off", selected: mode == "empty" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists,
+        let off = ["empty", "unselected", "off"].contains(mode)
+        let state: ProtectionState = off ? .disabled : mode == "selected" || mode == "socks5" ? .protected : ProtectionState(rawValue: mode) ?? .protected
+        snapshot = Snapshot(state: state, enabled: !off, selected: mode == "empty" || mode == "unselected" ? nil : mode == "socks5" ? 11 : 2, network: "Wi-Fi", lists: lists,
                             app_routing: mode == "selected" ? AppRouting(mode: .selected, bundle_ids: ["com.burbn.instagram", "com.google.ios.youtube"]) : AppRouting())
     }
     func send(_ request: Request) -> Reply {
@@ -202,6 +203,7 @@ actor PreviewService: Service {
         case .apps:
             return Reply(ok: true, apps: [InstalledApp(id: "com.burbn.instagram", name: "Instagram"), InstalledApp(id: "com.zhiliaoapp.musically", name: "TikTok"), InstalledApp(id: "com.google.ios.youtube", name: "YouTube")])
         case .testConnection:
+            if environment["SLIPSTREAM_PREVIEW_CHECK"] == "failed" { return Reply(ok: false, snapshot: snapshot, message: "Proxy did not respond.") }
             let udp = environment["SLIPSTREAM_PREVIEW_UDP"].flatMap(UDPRelay.init) ?? (snapshot.proxy?.type == .socks5 ? .relayed : .blocked)
             return Reply(ok: true, snapshot: snapshot, latency_ms: 42, udp: udp)
         case .importList:
@@ -214,7 +216,7 @@ actor PreviewService: Service {
         }
         return Reply(ok: true, snapshot: snapshot)
     }
-    func exitIP() -> String? { "203.0.113.42" }
+    func exitIP() -> String? { environment["SLIPSTREAM_PREVIEW_CHECK"] == "failed" ? nil : "203.0.113.42" }
 }
 #endif
 
@@ -548,6 +550,11 @@ struct HomeView: View {
                     }
                 }
             }.padding(.vertical, 6)
+            // iOS turns the configuration off when another VPN connects; a restart turns it back on.
+            if model.snapshot?.state == .unavailable {
+                Button("Restart Connection") { Task { await model.perform(.restart) } }
+                    .disabled(model.busy).accessibilityIdentifier("restartConnection")
+            }
             if let proxy = model.snapshot?.proxy {
                 DetailRow(label: "Proxy", caption: proxy.type == .socks5 ? "SOCKS5" : nil) {
                     Text(proxy.address).font(.system(.body, design: .monospaced)).selectableText()
@@ -583,11 +590,17 @@ struct HomeView: View {
                 }.disabled(model.checking).accessibilityIdentifier("testConnection")
             } header: { Text("Connection") } footer: {
                 if !model.checking, let date = model.checkedAt {
-                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))"
-                         + (model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""))
+                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))" + checkNote)
                 }
             }
         }
+    }
+    /// What the last check means for protected apps, when that needs saying.
+    private var checkNote: String {
+        if model.exitIP == nil && model.latencyMS == nil {
+            return ". Both checks failed, so protected apps may not be able to connect. Test again or choose another proxy."
+        }
+        return model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""
     }
     private var statusIcon: some View {
         Group {
@@ -621,8 +634,10 @@ struct HomeView: View {
     }
     private var statusSubtitle: String? {
         if let operation = model.operation { return operation }
-        guard model.snapshot?.enabled == true else { return nil }
-        return model.snapshot?.network
+        guard let snapshot = model.snapshot else { return nil }
+        if snapshot.enabled { return snapshot.network }
+        // The toggle stays off until a proxy is chosen; say how to choose one.
+        return snapshot.proxy == nil && !groups.allSatisfy({ $0.proxies.isEmpty }) ? "Choose a proxy below" : nil
     }
     private var statusSymbol: String {
         switch model.snapshot?.state {

@@ -171,7 +171,7 @@ xcrun simctl install booted build/simulator/Slipstream.app
 SIMCTL_CHILD_SLIPSTREAM_PREVIEW=selected xcrun simctl launch booted local.slipstream.app
 ```
 
-`SLIPSTREAM_PREVIEW` takes `empty`, `off`, `protected`, `starting`, `unavailable`,
+`SLIPSTREAM_PREVIEW` takes `empty`, `unselected`, `off`, `protected`, `starting`, `unavailable`,
 `selected`, or `socks5`; `SLIPSTREAM_PREVIEW_SHEET` opens `import`, `apps`, `lists`, or
 `help`.
 
