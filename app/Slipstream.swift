@@ -542,9 +542,8 @@ struct HomeView: View {
             }
             Button { showingApps = true } label: {
                 HStack {
-                    Text("Apps").foregroundColor(.primary)
-                    Spacer()
-                    Text(model.snapshot?.app_routing.summary ?? "All apps").foregroundColor(.secondary)
+                    DetailRow(label: "Apps") { Text(model.snapshot?.app_routing.summary ?? "All apps") }
+                        .foregroundColor(.primary).frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).foregroundColor(Color(.tertiaryLabel))
                 }
             }.disabled(model.busy || model.snapshot == nil).accessibilityIdentifier("appRouting")
