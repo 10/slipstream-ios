@@ -549,6 +549,11 @@ struct HomeView: View {
                     }
                 }
             }.padding(.vertical, 6)
+            // iOS turns the configuration off when another VPN connects; a restart turns it back on.
+            if model.snapshot?.state == .unavailable {
+                Button("Restart Connection") { Task { await model.perform(.restart) } }
+                    .disabled(model.busy).accessibilityIdentifier("restartConnection")
+            }
             if let proxy = model.snapshot?.proxy {
                 DetailRow(label: "Proxy", caption: proxy.type == .socks5 ? "SOCKS5" : nil) {
                     Text(proxy.address).font(.system(.body, design: .monospaced)).selectableText()
