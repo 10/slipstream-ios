@@ -373,6 +373,7 @@ let slipstreamOnTint = Color(UIColor { $0.userInterfaceStyle == .dark ? .black :
 struct HomeView: View {
     @ObservedObject var model: TunnelModel
     @Environment(\.scenePhase) private var phase
+    @Environment(\.sizeCategory) private var textSize
     @State private var search = ""
     @State private var listID: UInt64 = 0
     @State private var importing = false
@@ -519,25 +520,20 @@ struct HomeView: View {
     }
     private var protection: some View {
         Section {
-            HStack(spacing: 12) {
-                HStack(spacing: 12) {
-                    Group {
-                        if model.operation != nil || (model.snapshot == nil && model.error == nil) { ProgressView() }
-                        else { Image(systemName: statusSymbol).font(.title).foregroundColor(statusColor) }
-                    }.frame(width: 36)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(statusTitle).font(.title3.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
-                        if let subtitle = statusSubtitle { Text(subtitle).font(.subheadline).foregroundColor(.secondary) }
+            Group {
+                if textSize.isAccessibilityCategory {
+                    // The title needs the row's full width, so the toggle moves up beside the symbol.
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack { statusIcon.accessibilityHidden(true); Spacer(minLength: 0); protectionToggle }
+                        statusText.accessibilityElement(children: .combine)
                     }
-                }.accessibilityElement(children: .combine)
-                Spacer(minLength: 0)
-                Toggle("Protection", isOn: Binding(get: {
-                    model.snapshot?.enabled == true
-                }, set: { enabled in
-                    Task { await model.perform(enabled ? .enable : .disable) }
-                }))
-                .labelsHidden().disabled(model.busy || model.snapshot == nil || (model.snapshot?.selected == nil && model.snapshot?.enabled != true))
-                .accessibilityLabel("Protection").accessibilityIdentifier("protectionToggle")
+                } else {
+                    HStack(spacing: 12) {
+                        HStack(spacing: 12) { statusIcon; statusText }.accessibilityElement(children: .combine)
+                        Spacer(minLength: 0)
+                        protectionToggle
+                    }
+                }
             }.padding(.vertical, 6)
             if let proxy = model.snapshot?.proxy {
                 DetailRow(label: "Proxy", caption: proxy.type == .socks5 ? "SOCKS5" : nil) {
@@ -546,9 +542,8 @@ struct HomeView: View {
             }
             Button { showingApps = true } label: {
                 HStack {
-                    Text("Apps").foregroundColor(.primary)
-                    Spacer()
-                    Text(model.snapshot?.app_routing.summary ?? "All apps").foregroundColor(.secondary)
+                    DetailRow(label: "Apps") { Text(model.snapshot?.app_routing.summary ?? "All apps") }
+                        .foregroundColor(.primary).frame(maxWidth: .infinity, alignment: .leading)
                     Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).foregroundColor(Color(.tertiaryLabel))
                 }
             }.disabled(model.busy || model.snapshot == nil).accessibilityIdentifier("appRouting")
@@ -580,6 +575,27 @@ struct HomeView: View {
                 }
             }
         }
+    }
+    private var statusIcon: some View {
+        Group {
+            if model.operation != nil || (model.snapshot == nil && model.error == nil) { ProgressView() }
+            else { Image(systemName: statusSymbol).font(.title).foregroundColor(statusColor) }
+        }.frame(width: 36)
+    }
+    private var statusText: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(statusTitle).font(.title3.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+            if let subtitle = statusSubtitle { Text(subtitle).font(.subheadline).foregroundColor(.secondary) }
+        }
+    }
+    private var protectionToggle: some View {
+        Toggle("Protection", isOn: Binding(get: {
+            model.snapshot?.enabled == true
+        }, set: { enabled in
+            Task { await model.perform(enabled ? .enable : .disable) }
+        }))
+        .labelsHidden().disabled(model.busy || model.snapshot == nil || (model.snapshot?.selected == nil && model.snapshot?.enabled != true))
+        .accessibilityLabel("Protection").accessibilityIdentifier("protectionToggle")
     }
     private var statusTitle: String {
         switch model.snapshot?.state {
