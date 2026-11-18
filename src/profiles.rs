@@ -225,6 +225,9 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         let reordered;
         let line = match line.rsplit_once('@') {
             Some((credentials, endpoint)) if !address_first => {
+                if endpoint.matches(':').count() != 1 {
+                    return Err(error("Use user:pass@ip:port."));
+                }
                 reordered = format!("{endpoint}:{credentials}");
                 reordered.as_str()
             }
@@ -378,6 +381,8 @@ mod tests {
             ("http://SECRET:SECRET@203.0.113.4:80", ProxyKind::Socks5, "Choose HTTP"),
             ("https://SECRET:SECRET@203.0.113.4:443", ProxyKind::Http, "http:// or socks5://"),
             ("SECRET:SECRET@example.org:80", ProxyKind::Http, "IPv4"),
+            ("SECRET:SECRET@203.0.113.4:80:extra", ProxyKind::Http, "user:pass@ip:port"),
+            ("SECRET:SECRET@203.0.113.4", ProxyKind::Http, "user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
             assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
