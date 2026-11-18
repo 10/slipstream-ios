@@ -180,8 +180,36 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         if line.is_empty() {
             continue;
         }
-        let parts: Vec<_> = line.splitn(4, ':').map(str::trim).collect();
         let error = |message: &str| format!("Line {}: {message}", i + 1);
+        // Providers also export scheme://ip:port, where the scheme must match the list's type...
+        let line = match line.split_once("://") {
+            Some((scheme, rest)) if scheme.bytes().all(|c| c.is_ascii_alphanumeric()) => {
+                let scheme = scheme.to_ascii_lowercase();
+                match (scheme.as_str(), kind) {
+                    ("http", ProxyKind::Http) | ("socks5" | "socks5h", ProxyKind::Socks5) => rest,
+                    ("http", _) => return Err(error("Choose HTTP to import http:// proxies.")),
+                    ("socks5" | "socks5h", _) => {
+                        return Err(error("Choose SOCKS5 to import socks5:// proxies."));
+                    }
+                    _ => return Err(error("Use an http:// or socks5:// proxy.")),
+                }
+            }
+            _ => line,
+        };
+        // ...and user:pass@ip:port. A line that starts with an address keeps any @ in its password.
+        let address_first = line
+            .split(':')
+            .next()
+            .is_some_and(|host| host.trim().parse::<Ipv4Addr>().is_ok());
+        let reordered;
+        let line = match line.rsplit_once('@') {
+            Some((credentials, endpoint)) if !address_first => {
+                reordered = format!("{endpoint}:{credentials}");
+                reordered.as_str()
+            }
+            _ => line,
+        };
+        let parts: Vec<_> = line.splitn(4, ':').map(str::trim).collect();
         if parts.len() != 2 && parts.len() != 4 {
             return Err(error("Use ip:port or ip:port:user:pass."));
         }
@@ -287,6 +315,33 @@ mod tests {
         assert_eq!(legacy.kind, ProxyKind::Http);
         let saved = serde_json::to_string(&library.lists[0].proxies[0]).unwrap();
         assert!(saved.contains(r#""type":"socks5""#));
+    }
+
+    #[test]
+    fn provider_exports_with_credentials_first_or_a_matching_scheme_import() {
+        let http = parse_list(
+            "user:p@ss:word@203.0.113.1:3128\nhttp://user:pass@203.0.113.2:80\nHTTP://203.0.113.3:80",
+            ProxyKind::Http,
+        )
+        .unwrap();
+        assert_eq!(engine_view(&http[0]), (tun2proxy::ProxyType::Http, "203.0.113.1:3128".into(), "user".into(), "p@ss:word".into()));
+        assert_eq!(http[1].url(), "http://user:pass@203.0.113.2:80");
+        assert_eq!(http[2].url(), "http://203.0.113.3:80");
+        let socks = parse_list("socks5://u:p@203.0.113.4:1080\nsocks5h://203.0.113.5:1080", ProxyKind::Socks5).unwrap();
+        assert_eq!(socks[0].url(), "socks5://u:p@203.0.113.4:1080");
+        assert_eq!(socks[1].url(), "socks5://203.0.113.5:1080");
+        // The colon format keeps @ and :// inside a password.
+        let colon = parse_list("203.0.113.1:3128:user:p@ss\n203.0.113.2:3128:user:pa://ss", ProxyKind::Http).unwrap();
+        assert_eq!((colon[0].password.as_str(), colon[1].password.as_str()), ("p@ss", "pa://ss"));
+        for (line, kind, message) in [
+            ("socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "Choose SOCKS5"),
+            ("http://SECRET:SECRET@203.0.113.4:80", ProxyKind::Socks5, "Choose HTTP"),
+            ("https://SECRET:SECRET@203.0.113.4:443", ProxyKind::Http, "http:// or socks5://"),
+            ("SECRET:SECRET@example.org:80", ProxyKind::Http, "IPv4"),
+        ] {
+            let error = parse_list(line, kind).err().unwrap();
+            assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
+        }
     }
 
     #[test]
