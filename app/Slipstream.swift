@@ -398,7 +398,8 @@ struct HomeView: View {
                 if let error = model.error {
                     Section {
                         ErrorLabel(message: error)
-                        Button("Refresh Status") { Task { await model.refresh() } }.disabled(model.busy)
+                        // A failed change leaves its error until the status is read again on request.
+                        Button("Refresh Status") { Task { model.error = nil; await model.refresh() } }.disabled(model.busy)
                     }
                 }
                 if let notice = model.notice {
