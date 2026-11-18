@@ -744,8 +744,9 @@ struct ImportView: View {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         Task {
                             if await model.perform(.importList(name: name, type: type, text: text)) { text = ""; presentation.wrappedValue.dismiss() }
-                            // The sheet shows the error, so Home does not keep it after Cancel.
-                            else { localError = model.error; model.error = nil }
+                            // The sheet shows the error, so Home does not keep it after Cancel. A status
+                            // error stays on Home too, where it explains the missing status.
+                            else { localError = model.error; if model.snapshot != nil { model.error = nil } }
                         }
                     }.font(Font.body.weight(.semibold)).disabled(model.busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
