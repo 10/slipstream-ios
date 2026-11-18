@@ -251,7 +251,9 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                 // part of them. ip:port:user:pass keeps any credentials literally.
                 let plain = |part: &str| {
                     !part.is_empty()
-                        && !part.contains(|c: char| c.is_whitespace() || "@:/\\%#[]".contains(c))
+                        && part
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"-_.~!$&*+^".contains(&c))
                 };
                 let schemes = [
                     "http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h",
@@ -450,6 +452,11 @@ mod tests {
             ("SECRET:SEC%40RET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("SECRET:SEC@RET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("SECRET:pa://SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("US,SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("1)SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("http_proxy=SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("\u{200b}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:SECRET\u{feff}@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("http://SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "http://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
