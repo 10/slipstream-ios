@@ -872,7 +872,7 @@ struct HelpView: View {
                 Section(header: Text("Protection")) {
                     Text("Runs even when the app is closed. Switching proxies or failing a connection check never allows protected apps to connect directly.")
                     Text("Exit IP is verified by ipify.org. Turn protection off to use your normal connection.")
-                    Text("Proxy latency measures a fresh TCP handshake to the selected proxy. For SOCKS5 proxies, UDP reports whether the proxy grants a UDP relay. Test connection refreshes both; they are not continuously monitored.")
+                    Text("Proxy latency measures a fresh TCP handshake to the selected proxy. For SOCKS5 proxies, UDP reports whether the proxy grants a UDP relay. Test Connection refreshes both; they are not continuously monitored.")
                 }
                 Section(header: Text("Apps")) {
                     Text("All apps protects every app you installed; an app installed later is included when protection next restarts. Selected apps protects your choices. Apple’s apps, including Safari, and system services use your normal connection. Slipstream’s connection check is always included.")
