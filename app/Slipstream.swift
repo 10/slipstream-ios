@@ -13,7 +13,7 @@ struct SavedProxy: Decodable, Identifiable, Equatable {
     var credentials: String { username.isEmpty ? "" : "\(username):\(password)" }
     var line: String { credentials.isEmpty ? address : "\(address):\(credentials)" }
 }
-struct SavedList: Decodable, Identifiable {
+struct SavedList: Decodable, Identifiable, Equatable {
     var id: UInt64
     var name: String
     var proxies: [SavedProxy]
@@ -56,7 +56,7 @@ struct AppIcon: View {
     }
 }
 enum ProtectionState: String, Decodable { case protected, starting, unavailable, disabled }
-struct Snapshot: Decodable {
+struct Snapshot: Decodable, Equatable {
     var state: ProtectionState
     var enabled: Bool
     var selected: UInt64?
@@ -268,7 +268,8 @@ let slipstreamOnTint = Color(UIColor { $0.userInterfaceStyle == .dark ? .black :
                     revision += 1
                     clearCheck()
                 }
-                snapshot = updated
+                // Each assignment redraws every proxy row, so the five-second poll assigns only changes.
+                if snapshot != updated { snapshot = updated }
             }
             if !result.ok {
                 refreshError = true
