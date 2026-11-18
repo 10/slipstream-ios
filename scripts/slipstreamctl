@@ -3,7 +3,7 @@ set -eu
 PATH=/var/jb/usr/bin:/var/jb/bin:/var/jb/usr/sbin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 case "${1:-status}" in
- enable|disable|restart|status) exec /var/jb/usr/local/bin/slipstream "${1:-status}" ;;
+ enable|disable|restart|status|check) exec /var/jb/usr/local/bin/slipstream "${1:-status}" ;;
  uninstall) exec apt-get remove io.github.10.slipstream ;;
- *) echo 'usage: slipstreamctl enable|disable|restart|status|uninstall' >&2; exit 2 ;;
+ *) echo 'usage: slipstreamctl enable|disable|restart|status|check|uninstall' >&2; exit 2 ;;
 esac
