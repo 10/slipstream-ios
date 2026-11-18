@@ -105,6 +105,7 @@ The app covers everything, but the same controls work over SSH as root:
 
 ```bash
 slipstreamctl status     # protected, starting, unavailable, or disabled
+slipstreamctl check      # proxy latency and UDP, as Test Connection reports them
 slipstreamctl enable
 slipstreamctl restart
 slipstreamctl disable
