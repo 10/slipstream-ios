@@ -4,8 +4,7 @@ use crate::{Result, native, store};
 use serde::Serialize;
 use std::{
     fs,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
     time::{Duration, Instant},
 };
@@ -81,15 +80,16 @@ pub fn status() -> Result<State> {
     locked(state)
 }
 
-/// Marks protection pending: on, with a change not yet applied.
+/// Marks protection pending: on, with a change not yet applied. The marker is overwritten in
+/// place, never truncated first, because an empty marker means the change was applied.
 fn mark_pending() -> Result<fs::File> {
     let marker = fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
         .open(ENABLED)?;
-    (&marker).write_all(b"starting\n")?;
+    marker.write_all_at(b"starting\n", 0)?;
     marker.sync_all()?;
     Ok(marker)
 }

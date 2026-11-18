@@ -151,8 +151,13 @@ fn apply(request: Request, lib: &mut Library) -> Result<Outcome> {
             });
         }
         Request::Select { id } => {
+            let saved = lib.selected;
             lib.select(id)?;
-            lifecycle::stage(|| store::save_library(lib))?;
+            // The reply reports the selection; it changes only if the save happens.
+            if let Err(error) = lifecycle::stage(|| store::save_library(lib)) {
+                lib.selected = saved;
+                return Err(error);
+            }
             ctl("enable")?;
         }
         Request::Enable => {
