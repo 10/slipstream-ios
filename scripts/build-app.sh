@@ -34,8 +34,9 @@ if [ "$platform" = iphoneos ]; then
   -o "$extension/AppProxyProvider"
  ldid -Ilocal.slipstream.app.proxy -Sprovider/entitlements.plist "$extension/AppProxyProvider"
  # iOS 14 lacks the Swift concurrency runtime. Newer systems load theirs from /usr/lib/swift first.
+ # Xcode's copy carries 7 MB of embedded bitcode, which nothing on the phone reads.
  mkdir -p "$output/Frameworks"
- cp "$(dirname "$(xcrun --find swiftc)")/../lib/swift-5.5/iphoneos/libswift_Concurrency.dylib" "$output/Frameworks/"
+ xcrun bitcode_strip -r "$(dirname "$(xcrun --find swiftc)")/../lib/swift-5.5/iphoneos/libswift_Concurrency.dylib" -o "$output/Frameworks/libswift_Concurrency.dylib"
  ldid -S "$output/Frameworks/libswift_Concurrency.dylib"
  ldid -Ilocal.slipstream.app -Sapp/entitlements.plist "$output/Slipstream"
  ldid -Ilocal.slipstream.app -Spackaging/cli-entitlements.plist "$output/slipstream-helper"
