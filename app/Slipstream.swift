@@ -516,8 +516,20 @@ struct HomeView: View {
             items.append(MenuItem(title: "Restart Connection", symbol: "arrow.clockwise") {
                 Task { await model.perform(.restart) }
             })
+            if let next = nextProxy {
+                items.append(MenuItem(title: "Next Proxy", symbol: "arrow.right") {
+                    Task { await model.perform(.select(id: next.id)) }
+                })
+            }
         }
         return items
+    }
+    /// The proxy after the selected one in its list, wrapping to the first.
+    private var nextProxy: SavedProxy? {
+        guard let selected = model.snapshot?.selected,
+              let proxies = groups.first(where: { $0.proxies.contains { $0.id == selected } })?.proxies,
+              proxies.count > 1, let index = proxies.firstIndex(where: { $0.id == selected }) else { return nil }
+        return proxies[(index + 1) % proxies.count]
     }
     private var protection: some View {
         Section {
