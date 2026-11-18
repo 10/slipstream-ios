@@ -195,7 +195,7 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
     let mut result = vec![];
     let mut seen = HashSet::new();
     for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim().trim_start_matches('\u{feff}');
+        let line = raw.trim().trim_start_matches('\u{feff}').trim_start();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -265,13 +265,11 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                 });
                 // Only ASCII whitespace, and a byte-order mark opening the text, may be trimmed
                 // from around these credentials; a non-breaking space might belong to them.
-                let bare = raw.trim_matches(|c: char| c.is_ascii_whitespace());
-                let bare = if i == 0 {
-                    bare.trim_start_matches('\u{feff}')
-                } else {
-                    bare
+                let bare = match i {
+                    0 => raw.strip_prefix('\u{feff}').unwrap_or(raw),
+                    _ => raw,
                 };
-                if !url && (!strict || bare != line) {
+                if !url && (!strict || bare.trim_ascii() != line.trim_ascii()) {
                     return Err(error("Write this proxy as ip:port:user:pass."));
                 }
                 reordered = format!("{endpoint}:{credentials}");
@@ -420,6 +418,7 @@ mod tests {
         assert_eq!(socks[1].url(), "socks5://203.0.113.5:1080");
         // A byte-order mark is trimmed only where it opens the text.
         assert_eq!(parse_list("\u{feff}user:pass@203.0.113.4:8080", ProxyKind::Http).unwrap()[0].username, "user");
+        assert_eq!(parse_list("\u{feff} user:pass@203.0.113.4:8080\r\n", ProxyKind::Http).unwrap()[0].username, "user");
         let error = parse_list("# pool\n\u{feff}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http).err().unwrap();
         assert!(error.starts_with("Line 2:") && !error.contains("SECRET"), "{error}");
         // A URL's host follows its last @, even when its username looks like an address.
@@ -470,6 +469,8 @@ mod tests {
             ("\u{200b}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("SECRET:SECRET\u{feff}@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("\u{a0}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            (" \u{feff}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("\u{feff}\u{feff}SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("http://SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "http://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
