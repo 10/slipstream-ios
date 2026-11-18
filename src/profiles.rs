@@ -177,7 +177,7 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
     let mut seen = HashSet::new();
     for (i, raw) in text.lines().enumerate() {
         let line = raw.trim().trim_start_matches('\u{feff}');
-        if line.is_empty() {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let error = |message: &str| format!("Line {}: {message}", i + 1);
@@ -342,6 +342,14 @@ mod tests {
             let error = parse_list(line, kind).err().unwrap();
             assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
         }
+    }
+
+    #[test]
+    fn comment_lines_are_skipped_and_errors_keep_their_line_numbers() {
+        let entries = parse_list("# Residential, US\n203.0.113.1:80\n  # spare\n", ProxyKind::Http).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(parse_list("# header\nexample.org:80", ProxyKind::Http).err().unwrap(), "Line 2: Enter a numeric IPv4 address.");
+        assert!(parse_list("# only a comment", ProxyKind::Http).is_err());
     }
 
     #[test]
