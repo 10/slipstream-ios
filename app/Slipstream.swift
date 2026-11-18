@@ -203,6 +203,7 @@ actor PreviewService: Service {
         case .apps:
             return Reply(ok: true, apps: [InstalledApp(id: "com.burbn.instagram", name: "Instagram"), InstalledApp(id: "com.zhiliaoapp.musically", name: "TikTok"), InstalledApp(id: "com.google.ios.youtube", name: "YouTube")])
         case .testConnection:
+            if environment["SLIPSTREAM_PREVIEW_CHECK"] == "failed" { return Reply(ok: false, snapshot: snapshot, message: "Proxy did not respond.") }
             let udp = environment["SLIPSTREAM_PREVIEW_UDP"].flatMap(UDPRelay.init) ?? (snapshot.proxy?.type == .socks5 ? .relayed : .blocked)
             return Reply(ok: true, snapshot: snapshot, latency_ms: 42, udp: udp)
         case .importList:
@@ -215,7 +216,7 @@ actor PreviewService: Service {
         }
         return Reply(ok: true, snapshot: snapshot)
     }
-    func exitIP() -> String? { "203.0.113.42" }
+    func exitIP() -> String? { environment["SLIPSTREAM_PREVIEW_CHECK"] == "failed" ? nil : "203.0.113.42" }
 }
 #endif
 
@@ -589,11 +590,17 @@ struct HomeView: View {
                 }.disabled(model.checking).accessibilityIdentifier("testConnection")
             } header: { Text("Connection") } footer: {
                 if !model.checking, let date = model.checkedAt {
-                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))"
-                         + (model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""))
+                    Text("Checked at \(DateFormatter.localizedString(from: date, dateStyle: .none, timeStyle: .short))" + checkNote)
                 }
             }
         }
+    }
+    /// What the last check means for protected apps, when that needs saying.
+    private var checkNote: String {
+        if model.exitIP == nil && model.latencyMS == nil {
+            return ". This proxy didn’t respond, so protected apps can’t connect until it recovers or you choose another."
+        }
+        return model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""
     }
     private var statusIcon: some View {
         Group {
