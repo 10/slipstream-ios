@@ -169,6 +169,25 @@ fn list_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+/// Decodes %XX escapes; None for a malformed escape or a result that is not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let hex = rest
+            .get(..2)
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))?;
+        bytes.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+        rest = &rest[2..];
+    }
+    String::from_utf8(bytes).ok()
+}
+
 pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
     if text.len() > MAX_IMPORT_BYTES {
         return Err("Choose a text file smaller than 1 MB.".into());
@@ -182,11 +201,13 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         }
         let error = |message: &str| format!("Line {}: {message}", i + 1);
         // Providers also export scheme://ip:port, where the scheme must match the list's type...
-        let line = match line.split_once("://") {
+        let (line, url) = match line.split_once("://") {
             Some((scheme, rest)) if scheme.bytes().all(|c| c.is_ascii_alphanumeric()) => {
                 let scheme = scheme.to_ascii_lowercase();
                 match (scheme.as_str(), kind) {
-                    ("http", ProxyKind::Http) | ("socks5" | "socks5h", ProxyKind::Socks5) => rest,
+                    ("http", ProxyKind::Http) | ("socks5" | "socks5h", ProxyKind::Socks5) => {
+                        (rest.strip_suffix('/').unwrap_or(rest), true)
+                    }
                     ("http", _) => return Err(error("Choose HTTP to import http:// proxies.")),
                     ("socks5" | "socks5h", _) => {
                         return Err(error("Choose SOCKS5 to import socks5:// proxies."));
@@ -194,7 +215,7 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                     _ => return Err(error("Use an http:// or socks5:// proxy.")),
                 }
             }
-            _ => line,
+            _ => (line, false),
         };
         // ...and user:pass@ip:port. A line that starts with an address keeps any @ in its password.
         let address_first = line
@@ -225,13 +246,27 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
             .map_err(|_| error("Port must be 1–65535."))?
             .get();
         let (username, password) = if parts.len() == 4 {
-            if parts[2].is_empty() || parts[3].is_empty() {
+            // URLs carry credentials percent-encoded.
+            let decode = |part: &str| {
+                if url {
+                    percent_decode(part)
+                } else {
+                    Some(part.to_owned())
+                }
+            };
+            let (Some(username), Some(password)) = (decode(parts[2]), decode(parts[3])) else {
+                return Err(error("Credentials contain an invalid % escape."));
+            };
+            if username.is_empty() || password.is_empty() {
                 return Err(error("Username and password are both required."));
             }
-            if parts[2..].iter().any(|v| v.chars().any(char::is_control)) {
+            if [&username, &password]
+                .iter()
+                .any(|v| v.chars().any(char::is_control))
+            {
                 return Err(error("Credentials contain a control character."));
             }
-            (parts[2].to_owned(), parts[3].to_owned())
+            (username, password)
         } else {
             (String::new(), String::new())
         };
@@ -330,9 +365,14 @@ mod tests {
         let socks = parse_list("socks5://u:p@203.0.113.4:1080\nsocks5h://203.0.113.5:1080", ProxyKind::Socks5).unwrap();
         assert_eq!(socks[0].url(), "socks5://u:p@203.0.113.4:1080");
         assert_eq!(socks[1].url(), "socks5://203.0.113.5:1080");
-        // The colon format keeps @ and :// inside a password.
-        let colon = parse_list("203.0.113.1:3128:user:p@ss\n203.0.113.2:3128:user:pa://ss", ProxyKind::Http).unwrap();
-        assert_eq!((colon[0].password.as_str(), colon[1].password.as_str()), ("p@ss", "pa://ss"));
+        // URL credentials are percent-encoded, and a URL may end with a slash.
+        let url = parse_list("http://us%3Aer:p%40ss%25@203.0.113.6:80/", ProxyKind::Http).unwrap();
+        assert_eq!(engine_view(&url[0]), (tun2proxy::ProxyType::Http, "203.0.113.6:80".into(), "us:er".into(), "p@ss%".into()));
+        assert!(parse_list("http://u:p%zz@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("% escape"));
+        assert!(parse_list("http://u:p%0A@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("control character"));
+        // The colon format keeps @, :// and % inside a password.
+        let colon = parse_list("203.0.113.1:3128:user:p@ss\n203.0.113.2:3128:user:pa://ss\n203.0.113.3:3128:user:p%40ss", ProxyKind::Http).unwrap();
+        assert_eq!(colon.iter().map(|p| p.password.as_str()).collect::<Vec<_>>(), ["p@ss", "pa://ss", "p%40ss"]);
         for (line, kind, message) in [
             ("socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "Choose SOCKS5"),
             ("http://SECRET:SECRET@203.0.113.4:80", ProxyKind::Socks5, "Choose HTTP"),
