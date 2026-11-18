@@ -743,7 +743,8 @@ struct ImportView: View {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         Task {
                             if await model.perform(.importList(name: name, type: type, text: text)) { text = ""; presentation.wrappedValue.dismiss() }
-                            else { localError = model.error }
+                            // The sheet shows the error, so Home does not keep it after Cancel.
+                            else { localError = model.error; model.error = nil }
                         }
                     }.font(Font.body.weight(.semibold)).disabled(model.busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
