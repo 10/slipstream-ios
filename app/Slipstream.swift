@@ -514,11 +514,11 @@ struct HomeView: View {
             items.append(MenuItem(title: "Restart Connection", symbol: "arrow.clockwise") {
                 Task { await model.perform(.restart) }
             })
-        }
-        if let next = nextProxy {
-            items.append(MenuItem(title: "Next Proxy", symbol: "arrow.right") {
-                Task { await model.perform(.select(id: next.id)) }
-            })
+            if let next = nextProxy {
+                items.append(MenuItem(title: "Next Proxy", symbol: "arrow.right") {
+                    Task { await model.perform(.select(id: next.id)) }
+                })
+            }
         }
         return items
     }
