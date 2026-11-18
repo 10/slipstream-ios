@@ -215,7 +215,11 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                         let host = authority
                             .rsplit_once('@')
                             .map_or(authority, |(_, host)| host);
-                        if !matches!(tail, "" | "/") || host.matches(':').count() != 1 {
+                        // A URL holds no raw whitespace, so trimming it would change a password.
+                        if !matches!(tail, "" | "/")
+                            || host.matches(':').count() != 1
+                            || authority.contains(char::is_whitespace)
+                        {
                             return Err(error(&format!("Use {scheme}://user:pass@ip:port.")));
                         }
                         (authority, true)
@@ -239,7 +243,14 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         let reordered;
         let line = match line.rsplit_once('@') {
             Some((credentials, endpoint)) if !address_first => {
-                if endpoint.matches(':').count() != 1 {
+                // A scheme name for a username, or a password that starts with a slash, is a
+                // mistyped URL such as http:/user:pass@ip:port, not credentials.
+                let (username, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+                let scheme_name = ["http", "https", "socks4", "socks5", "socks5h"]
+                    .iter()
+                    .any(|name| username.trim().eq_ignore_ascii_case(name));
+                let mistyped_url = !url && (scheme_name || password.trim_start().starts_with('/'));
+                if endpoint.matches(':').count() != 1 || mistyped_url {
                     return Err(error("Use user:pass@ip:port."));
                 }
                 reordered = format!("{endpoint}:{credentials}");
@@ -418,6 +429,10 @@ mod tests {
             ("http://SECRET:SECRET@203.0.113.4:80\\x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
             ("\u{200b}socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
             ("socks5 ://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
+            ("http:/SECRET:SECRET@203.0.113.4:8080", ProxyKind::Socks5, "user:pass@ip:port"),
+            ("socks5:/SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "user:pass@ip:port"),
+            ("HTTP:SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "user:pass@ip:port"),
+            ("http://SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "http://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
             assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
