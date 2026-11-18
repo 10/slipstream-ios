@@ -598,7 +598,7 @@ struct HomeView: View {
     /// What the last check means for protected apps, when that needs saying.
     private var checkNote: String {
         if model.exitIP == nil && model.latencyMS == nil {
-            return ". This proxy didn’t respond, so protected apps can’t connect until it recovers or you choose another."
+            return ". Both checks failed, so protected apps may not be able to connect. Test again or choose another proxy."
         }
         return model.udp == .unsupported ? ". This proxy doesn’t relay UDP, so calls and games that need it may fail." : ""
     }
