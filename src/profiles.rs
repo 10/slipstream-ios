@@ -243,15 +243,26 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
         let reordered;
         let line = match line.rsplit_once('@') {
             Some((credentials, endpoint)) if !address_first => {
-                // A scheme name for a username, or a password that starts with a slash, is a
-                // mistyped URL such as http:/user:pass@ip:port, not credentials.
-                let (username, password) = credentials.split_once(':').unwrap_or((credentials, ""));
-                let scheme_name = ["http", "https", "socks4", "socks5", "socks5h"]
-                    .iter()
-                    .any(|name| username.trim().eq_ignore_ascii_case(name));
-                let mistyped_url = !url && (scheme_name || password.trim_start().starts_with('/'));
-                if endpoint.matches(':').count() != 1 || mistyped_url {
+                if endpoint.matches(':').count() != 1 {
                     return Err(error("Use user:pass@ip:port."));
+                }
+                // Outside a URL, this form must be exactly user:pass@ip:port with plain
+                // credentials, so labels, comments, mistyped URLs and escapes are never read as
+                // part of them. ip:port:user:pass keeps any credentials literally.
+                let plain = |part: &str| {
+                    !part.is_empty()
+                        && !part.contains(|c: char| c.is_whitespace() || "@:/\\%#[]".contains(c))
+                };
+                let schemes = [
+                    "http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h",
+                ];
+                let strict = credentials.split_once(':').is_some_and(|(user, pass)| {
+                    plain(user)
+                        && plain(pass)
+                        && !schemes.iter().any(|name| user.eq_ignore_ascii_case(name))
+                });
+                if !url && !strict {
+                    return Err(error("Write this proxy as ip:port:user:pass."));
                 }
                 reordered = format!("{endpoint}:{credentials}");
                 reordered.as_str()
@@ -387,11 +398,11 @@ mod tests {
     #[test]
     fn provider_exports_with_credentials_first_or_a_matching_scheme_import() {
         let http = parse_list(
-            "user:p@ss:word@203.0.113.1:3128\nhttp://user:pass@203.0.113.2:80\nHTTP://203.0.113.3:80",
+            "user:pa-ss@203.0.113.1:3128\nhttp://user:pass@203.0.113.2:80\nHTTP://203.0.113.3:80",
             ProxyKind::Http,
         )
         .unwrap();
-        assert_eq!(engine_view(&http[0]), (tun2proxy::ProxyType::Http, "203.0.113.1:3128".into(), "user".into(), "p@ss:word".into()));
+        assert_eq!(engine_view(&http[0]), (tun2proxy::ProxyType::Http, "203.0.113.1:3128".into(), "user".into(), "pa-ss".into()));
         assert_eq!(http[1].url(), "http://user:pass@203.0.113.2:80");
         assert_eq!(http[2].url(), "http://203.0.113.3:80");
         let socks = parse_list("socks5://u:p@203.0.113.4:1080\nsocks5h://203.0.113.5:1080", ProxyKind::Socks5).unwrap();
@@ -408,9 +419,6 @@ mod tests {
         assert_eq!(engine_view(&socks[0]).2, "us:er");
         assert!(parse_list("http://u:p%zz@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("% escape"));
         assert!(parse_list("http://u:p%0A@203.0.113.6:80", ProxyKind::Http).err().unwrap().contains("control character"));
-        // Outside a URL, :// may sit inside a password.
-        let inside = parse_list("user:pa://ss@203.0.113.7:80", ProxyKind::Http).unwrap();
-        assert_eq!((inside[0].username.as_str(), inside[0].password.as_str()), ("user", "pa://ss"));
         // The colon format keeps @, :// and % inside a password.
         let colon = parse_list("203.0.113.1:3128:user:p@ss\n203.0.113.2:3128:user:pa://ss\n203.0.113.3:3128:user:p%40ss", ProxyKind::Http).unwrap();
         assert_eq!(colon.iter().map(|p| p.password.as_str()).collect::<Vec<_>>(), ["p@ss", "pa://ss", "p%40ss"]);
@@ -429,9 +437,19 @@ mod tests {
             ("http://SECRET:SECRET@203.0.113.4:80\\x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
             ("\u{200b}socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
             ("socks5 ://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "http:// or socks5://"),
-            ("http:/SECRET:SECRET@203.0.113.4:8080", ProxyKind::Socks5, "user:pass@ip:port"),
-            ("socks5:/SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "user:pass@ip:port"),
-            ("HTTP:SECRET:SECRET@203.0.113.4:8080", ProxyKind::Http, "user:pass@ip:port"),
+            // Credentials-first lines that are not plain user:pass@ip:port.
+            ("http:/SECRET:SECRET@203.0.113.4:8080", ProxyKind::Socks5, "ip:port:user:pass"),
+            ("socks5:/SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "ip:port:user:pass"),
+            ("HTTP:SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("socks5//SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "ip:port:user:pass"),
+            ("socks5 SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "ip:port:user:pass"),
+            ("Proxy: socks5://SECRET:SECRET@203.0.113.4:1080", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:SECRET@203.0.113.4:80 # spare SECRET:SECRET@198.51.100.20:3128", ProxyKind::Http, "ip:port:user:pass"),
+            ("[2001:db8::1]:8080:SECRET:SECRET@203.0.113.4:80", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:SEC%40RET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:SEC@RET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
+            ("SECRET:pa://SECRET@203.0.113.4:8080", ProxyKind::Http, "ip:port:user:pass"),
             ("http://SECRET:SECRET @203.0.113.4:8080", ProxyKind::Http, "http://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
