@@ -2,7 +2,12 @@
 //! under one lock, so changes from the app and from SSH do not interleave.
 use crate::{Result, native, store};
 use serde::Serialize;
-use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    fs,
+    os::unix::fs::{FileExt, OpenOptionsExt},
+    path::Path,
+    time::{Duration, Instant},
+};
 
 /// Present while protection is on. Holds `starting` until a change completes, so an old
 /// connection is not reported as a completed switch.
@@ -45,8 +50,14 @@ fn locked<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
         .truncate(false)
         .mode(0o600)
         .open(LOCK)?;
-    if lock.try_lock().is_err() {
-        return Err("Another tunnel change is in progress. Retry shortly.".into());
+    // Another call, such as a status read over SSH, usually holds the lock for a moment. The wait
+    // leaves most of the 45-second deadline for this call's own work.
+    let waiting = Instant::now();
+    while lock.try_lock().is_err() {
+        if waiting.elapsed() > Duration::from_secs(10) {
+            return Err("Another tunnel change is in progress. Retry shortly.".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     body()
 }
@@ -69,6 +80,31 @@ pub fn status() -> Result<State> {
     locked(state)
 }
 
+/// Marks protection pending: on, with a change not yet applied. The marker is overwritten in
+/// place, never truncated first, because an empty marker means the change was applied.
+fn mark_pending() -> Result<fs::File> {
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(ENABLED)?;
+    marker.write_all_at(b"starting\n", 0)?;
+    marker.sync_all()?;
+    Ok(marker)
+}
+
+/// Saves settings for the next enable or restart to apply. While protection is on, the change is
+/// marked pending first, so status never reports saved settings as applied before they are.
+pub fn stage(save: impl FnOnce() -> Result<()>) -> Result<()> {
+    locked(|| {
+        if enabled() {
+            mark_pending()?;
+        }
+        save()
+    })
+}
+
 /// Runs `enable`, `restart` or `disable` and prints the resulting state.
 pub fn run(action: &str) -> Result<()> {
     let state = locked(|| {
@@ -88,14 +124,7 @@ pub fn run(action: &str) -> Result<()> {
                 .ok_or("Import a list and select a proxy first.")?;
             // The saved selection may already name a proxy the provider does not use yet, so the
             // change is pending until it is applied.
-            let marker = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(ENABLED)?;
-            (&marker).write_all(b"starting\n")?;
-            marker.sync_all()?;
+            let marker = mark_pending()?;
             native::tunnel_apply(&native::Settings {
                 proxy_url: proxy.url(),
                 proxy_ip: proxy.host,
