@@ -93,6 +93,7 @@ Priority: optional
 Depends: firmware (>= 14.0), uikittools (>= 2.1.2)
 Homepage: {SOURCE}
 Depiction: {REPO}
+Icon: {REPO}CydiaIcon.png
 Description: Per-app HTTP CONNECT / SOCKS5 proxy tunnel
  Routes apps' Internet traffic through your proxy using an iOS app proxy,
  which creates no tunnel interface.
@@ -154,11 +155,13 @@ def repository(output, debs, signing_key):
     keyprint = run('gpg', '--show-keys', '--with-colons', str(output/'repository-key.gpg'))
     fingerprint = next(line.split(':')[9] for line in keyprint.splitlines() if line.startswith('fpr:'))
     safe_url = html.escape(REPO, quote=True)
+    summary = 'Send a jailbroken iPhone’s app traffic through your HTTP CONNECT or SOCKS5 proxy, for every app you installed or only the ones you choose.'
     labels = {'iphoneos-arm64': 'Rootless, such as Dopamine or palera1n', 'iphoneos-arm': 'Rootful, such as Taurine'}
     downloads = ''.join(f'<li><a href="pool/{latest[arch][2]}">{labels[arch]}</a></li>' for arch in sorted(latest))
     (output/'index.html').write_text(f'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Slipstream</title>
+<meta name="description" content="{summary}"><meta property="og:title" content="Slipstream"><meta property="og:description" content="{summary}"><meta property="og:image" content="{safe_url}CydiaIcon.png">
 <style>:root{{color-scheme:light dark}}body{{font:17px/1.6 system-ui;max-width:42rem;margin:4rem auto;padding:0 1.5rem}}a{{color:light-dark(#0065f0,#4d97ff)}}code{{overflow-wrap:anywhere}}img{{border-radius:22%}}small{{display:block;margin-top:3rem}}</style>
-<main><img src="CydiaIcon.png" width="96" height="96" alt=""><h1>Slipstream</h1><p>Send a jailbroken iPhone’s app traffic through your HTTP CONNECT or SOCKS5 proxy, for every app you installed or only the ones you choose.</p>
+<main><img src="CydiaIcon.png" width="96" height="96" alt=""><h1>Slipstream</h1><p>{summary}</p>
 <p><a href="sileo://source/{safe_url}">Add to Sileo</a></p><p>Or add <code>{safe_url}</code> in Sileo → Sources → +.</p>
 <p>Version {ver} · iOS 14+ · Rootless and rootful jailbreaks</p>
 <p>Download the latest .deb:</p><ul>{downloads}</ul>
