@@ -93,6 +93,7 @@ Priority: optional
 Depends: firmware (>= 14.0), uikittools (>= 2.1.2)
 Homepage: {SOURCE}
 Depiction: {REPO}
+Icon: {REPO}CydiaIcon.png
 Description: Per-app HTTP CONNECT / SOCKS5 proxy tunnel
  Routes apps' Internet traffic through your proxy using an iOS app proxy,
  which creates no tunnel interface.
