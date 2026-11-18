@@ -206,7 +206,15 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
                 let scheme = scheme.to_ascii_lowercase();
                 match (scheme.as_str(), kind) {
                     ("http", ProxyKind::Http) | ("socks5" | "socks5h", ProxyKind::Socks5) => {
-                        (rest.strip_suffix('/').unwrap_or(rest), true)
+                        // The authority ends at the first slash; only an empty path is allowed.
+                        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+                        let host = authority
+                            .rsplit_once('@')
+                            .map_or(authority, |(_, host)| host);
+                        if !path.is_empty() || host.matches(':').count() != 1 {
+                            return Err(error(&format!("Use {scheme}://user:pass@ip:port.")));
+                        }
+                        (authority, true)
                     }
                     ("http", _) => return Err(error("Choose HTTP to import http:// proxies.")),
                     ("socks5" | "socks5h", _) => {
@@ -217,11 +225,13 @@ pub fn parse_list(text: &str, kind: ProxyKind) -> Result<Vec<Proxy>, String> {
             }
             _ => (line, false),
         };
-        // ...and user:pass@ip:port. A line that starts with an address keeps any @ in its password.
-        let address_first = line
-            .split(':')
-            .next()
-            .is_some_and(|host| host.trim().parse::<Ipv4Addr>().is_ok());
+        // ...and user:pass@ip:port. Outside a URL, a line that starts with an address keeps any @
+        // in its password.
+        let address_first = !url
+            && line
+                .split(':')
+                .next()
+                .is_some_and(|host| host.trim().parse::<Ipv4Addr>().is_ok());
         let reordered;
         let line = match line.rsplit_once('@') {
             Some((credentials, endpoint)) if !address_first => {
@@ -368,6 +378,9 @@ mod tests {
         let socks = parse_list("socks5://u:p@203.0.113.4:1080\nsocks5h://203.0.113.5:1080", ProxyKind::Socks5).unwrap();
         assert_eq!(socks[0].url(), "socks5://u:p@203.0.113.4:1080");
         assert_eq!(socks[1].url(), "socks5://203.0.113.5:1080");
+        // A URL's host follows its last @, even when its username looks like an address.
+        let host = parse_list("http://198.51.100.8:8080:x:y@203.0.113.9:3128", ProxyKind::Http).unwrap();
+        assert_eq!(engine_view(&host[0]), (tun2proxy::ProxyType::Http, "203.0.113.9:3128".into(), "198.51.100.8".into(), "8080:x:y".into()));
         // URL credentials are percent-encoded, and a URL may end with a slash.
         let url = parse_list("http://us%3Aer:p%40ss%25@203.0.113.6:80/", ProxyKind::Http).unwrap();
         assert_eq!(engine_view(&url[0]), (tun2proxy::ProxyType::Http, "203.0.113.6:80".into(), "us:er".into(), "p@ss%".into()));
@@ -383,6 +396,8 @@ mod tests {
             ("SECRET:SECRET@example.org:80", ProxyKind::Http, "IPv4"),
             ("SECRET:SECRET@203.0.113.4:80:extra", ProxyKind::Http, "user:pass@ip:port"),
             ("SECRET:SECRET@203.0.113.4", ProxyKind::Http, "user:pass@ip:port"),
+            ("http://SECRET:SECRET@203.0.113.4:80/x@198.51.100.1:80", ProxyKind::Http, "http://user:pass@ip:port"),
+            ("socks5://203.0.113.4:1080:SECRET:SECRET", ProxyKind::Socks5, "socks5://user:pass@ip:port"),
         ] {
             let error = parse_list(line, kind).err().unwrap();
             assert!(error.starts_with("Line 1:") && error.contains(message) && !error.contains("SECRET"), "{error}");
