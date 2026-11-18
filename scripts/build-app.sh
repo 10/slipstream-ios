@@ -29,7 +29,7 @@ if [ "$platform" = iphoneos ]; then
  for key in CFBundleShortVersionString CFBundleVersion; do plutil -replace "$key" -string "$version" "$extension/Info.plist"; done
  cargo build --locked --release --target aarch64-apple-ios --lib
  xcrun --sdk iphoneos clang -target "$target" -isysroot "$sdk" -Os -Wall -Wextra -Werror -fobjc-arc -fblocks \
-  -fapplication-extension -Wl,-e,_NSExtensionMain provider/AppProxyProvider.m target/aarch64-apple-ios/release/libslipstream.a \
+  -fapplication-extension -Wl,-e,_NSExtensionMain -Wl,-dead_strip,-x provider/AppProxyProvider.m target/aarch64-apple-ios/release/libslipstream.a \
   -framework Foundation -framework Network -framework NetworkExtension -framework SystemConfiguration -framework Security -framework CoreFoundation -liconv -lresolv \
   -o "$extension/AppProxyProvider"
  ldid -Ilocal.slipstream.app.proxy -Sprovider/entitlements.plist "$extension/AppProxyProvider"
