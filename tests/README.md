@@ -63,7 +63,7 @@ On-device, launch from SpringBoard; import invalid input and require a visible l
 
 Capture during proxy changes. A transition may legitimately use either the previous or new exact proxy endpoint; audit both explicitly. Exclude deliberate protection-off intervals from protected-traffic claims. Check a failed proxy while enabled, then recover by selecting a working proxy.
 
-Latency checks: the CLI requests the check from the connected provider in both routing modes. On-device, tap **Test connection** and compare its millisecond value with SYN→SYN/ACK timing in the physical-interface capture. A wrong selection ID must fail, and an unreachable selected proxy must yield no value after the three-second TCP timeout. Check that retesting/selection changes clear stale values, that the HTTPS exit-IP check remains independent, and that the UI stays static between tests. No temporary routing exceptions are needed.
+Latency checks: the CLI requests the check from the connected provider in both routing modes. On-device, tap **Test Connection** and compare its millisecond value with SYN→SYN/ACK timing in the physical-interface capture. A wrong selection ID must fail, and an unreachable selected proxy must yield no value after the three-second TCP timeout. Check that retesting/selection changes clear stale values, that the HTTPS exit-IP check remains independent, and that the UI stays static between tests. No temporary routing exceptions are needed.
 
 ## Packaging
 
