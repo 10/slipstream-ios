@@ -107,7 +107,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            drop(listener.accept().unwrap());
+            // Held open: hanging up at once can fail the client's connect with POLLHUP.
+            let _latency = listener.accept().unwrap();
             let (mut client, _) = listener.accept().unwrap();
             let mut greeting = [0u8; 3];
             client.read_exact(&mut greeting).unwrap();

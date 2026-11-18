@@ -731,7 +731,8 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let proxy = listener.local_addr().unwrap();
-        thread::spawn(move || listener.incoming().for_each(drop));
+        // Connections stay open: hanging up at once can fail the check's connect with POLLHUP.
+        thread::spawn(move || listener.incoming().collect::<Vec<_>>());
         start(&format!("http://{proxy}"));
         let check = || {
             let mut out = [0u8; 128];
