@@ -2,7 +2,13 @@
 //! under one lock, so changes from the app and from SSH do not interleave.
 use crate::{Result, native, store};
 use serde::Serialize;
-use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 /// Present while protection is on. Holds `starting` until a change completes, so an old
 /// connection is not reported as a completed switch.
@@ -45,8 +51,15 @@ fn locked<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
         .truncate(false)
         .mode(0o600)
         .open(LOCK)?;
-    if lock.try_lock().is_err() {
-        return Err("Another tunnel change is in progress. Retry shortly.".into());
+    // Another call, such as a status read over SSH, usually holds the lock for a moment. Failing
+    // at once would leave a just-saved proxy selection unapplied yet reported as protected.
+    // The wait leaves most of the 45-second deadline for this call's own work.
+    let waiting = Instant::now();
+    while lock.try_lock().is_err() {
+        if waiting.elapsed() > Duration::from_secs(10) {
+            return Err("Another tunnel change is in progress. Retry shortly.".into());
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     body()
 }
