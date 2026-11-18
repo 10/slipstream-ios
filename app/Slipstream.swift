@@ -318,6 +318,14 @@ let slipstreamOnTint = Color(UIColor { $0.userInterfaceStyle == .dark ? .black :
         return success
     }
 
+    /// Hands a failed change's error to the screen that shows it, so Home does not keep it too.
+    /// An error from reading status stays on Home, where it explains the missing status.
+    func takeChangeError() -> String? {
+        let message = error
+        if !refreshError { error = nil }
+        return message
+    }
+
     func installedApps() async throws -> [InstalledApp] {
         let reply = try await service.send(.apps)
         guard reply.ok, let apps = reply.apps else { throw URLError(.cannotLoadFromNetwork) }
@@ -400,7 +408,8 @@ struct HomeView: View {
                 if let error = model.error {
                     Section {
                         ErrorLabel(message: error)
-                        Button("Refresh Status") { Task { await model.refresh() } }.disabled(model.busy)
+                        // A failed change leaves its error until the status is read again on request.
+                        Button("Refresh Status") { Task { model.error = nil; await model.refresh() } }.disabled(model.busy)
                     }
                 }
                 if let notice = model.notice {
@@ -758,7 +767,7 @@ struct ImportView: View {
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                         Task {
                             if await model.perform(.importList(name: name, type: type, text: text)) { text = ""; presentation.wrappedValue.dismiss() }
-                            else { localError = model.error }
+                            else { localError = model.takeChangeError() }
                         }
                     }.font(Font.body.weight(.semibold)).disabled(model.busy || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
