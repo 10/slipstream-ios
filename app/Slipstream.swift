@@ -762,8 +762,9 @@ struct ImportView: View {
                     let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
                     guard size <= 1024 * 1024 else { localError = "Choose a text file smaller than 1 MB."; return }
                     let data = try Data(contentsOf: url)
-                    guard data.count <= 1024 * 1024, let imported = String(data: data, encoding: .utf8) else { localError = "Choose a UTF-8 text file smaller than 1 MB."; return }
-                    text = imported
+                    guard data.count <= 1024 * 1024, String(data: data, encoding: .utf8) != nil else { localError = "Choose a UTF-8 text file smaller than 1 MB."; return }
+                    // That decoder drops an opening byte-order mark; the importer judges it instead.
+                    text = String(decoding: data, as: UTF8.self)
                     if name.isEmpty { name = String(url.deletingPathExtension().lastPathComponent.prefix(40)) }
                     localError = nil
                 } catch { localError = "The file could not be opened. Choose another file or paste the list." }
