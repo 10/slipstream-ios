@@ -51,9 +51,8 @@ fn locked<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
         .truncate(false)
         .mode(0o600)
         .open(LOCK)?;
-    // Another call, such as a status read over SSH, usually holds the lock for a moment. Failing
-    // at once would leave a just-saved proxy selection unapplied yet reported as protected.
-    // The wait leaves most of the 45-second deadline for this call's own work.
+    // Another call, such as a status read over SSH, usually holds the lock for a moment. The wait
+    // leaves most of the 45-second deadline for this call's own work.
     let waiting = Instant::now();
     while lock.try_lock().is_err() {
         if waiting.elapsed() > Duration::from_secs(10) {
@@ -82,6 +81,30 @@ pub fn status() -> Result<State> {
     locked(state)
 }
 
+/// Marks protection pending: on, with a change not yet applied.
+fn mark_pending() -> Result<fs::File> {
+    let marker = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(ENABLED)?;
+    (&marker).write_all(b"starting\n")?;
+    marker.sync_all()?;
+    Ok(marker)
+}
+
+/// Saves settings for the next enable or restart to apply. While protection is on, the change is
+/// marked pending first, so status never reports saved settings as applied before they are.
+pub fn stage(save: impl FnOnce() -> Result<()>) -> Result<()> {
+    locked(|| {
+        if enabled() {
+            mark_pending()?;
+        }
+        save()
+    })
+}
+
 /// Runs `enable`, `restart` or `disable` and prints the resulting state.
 pub fn run(action: &str) -> Result<()> {
     let state = locked(|| {
@@ -101,14 +124,7 @@ pub fn run(action: &str) -> Result<()> {
                 .ok_or("Import a list and select a proxy first.")?;
             // The saved selection may already name a proxy the provider does not use yet, so the
             // change is pending until it is applied.
-            let marker = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(ENABLED)?;
-            (&marker).write_all(b"starting\n")?;
-            marker.sync_all()?;
+            let marker = mark_pending()?;
             native::tunnel_apply(&native::Settings {
                 proxy_url: proxy.url(),
                 proxy_ip: proxy.host,

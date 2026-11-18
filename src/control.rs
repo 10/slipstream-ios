@@ -123,7 +123,7 @@ fn apply(request: Request, lib: &mut Library) -> Result<Outcome> {
             if routing.mode == Mode::Selected {
                 routing.check_selection(&native::catalog()?)?;
             }
-            store::save_routing(&routing)?;
+            lifecycle::stage(|| store::save_routing(&routing))?;
             if enabled() {
                 ctl("restart")?;
             }
@@ -152,7 +152,7 @@ fn apply(request: Request, lib: &mut Library) -> Result<Outcome> {
         }
         Request::Select { id } => {
             lib.select(id)?;
-            store::save_library(lib)?;
+            lifecycle::stage(|| store::save_library(lib))?;
             ctl("enable")?;
         }
         Request::Enable => {
